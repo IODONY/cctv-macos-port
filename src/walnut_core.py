@@ -1,10 +1,15 @@
 import time
 from collections import Counter, deque
+from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+MODEL_ROOT = PROJECT_ROOT / "models"
 
 
 class WalnutAnalyzer:
@@ -104,12 +109,32 @@ class WalnutAnalyzer:
             print(f"Using Nvidia GPU: {device_name}")
             return "cuda:0"
 
-        print("CUDA is unavailable. Running on CPU.")
+        mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            print("Using Apple Silicon MPS.")
+            return "mps"
+
+        print("CUDA and MPS are unavailable. Running on CPU.")
         return "cpu"
 
+    def _resolve_model_path(self, model_name):
+        model_path = Path(model_name).expanduser()
+        if model_path.is_absolute():
+            resolved = model_path.resolve()
+            if not str(resolved).startswith(str(PROJECT_ROOT)):
+                raise ValueError(f"Model path must stay inside project root: {resolved}")
+            return str(resolved)
+
+        candidates = [MODEL_ROOT / model_path, PROJECT_ROOT / model_path]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate.resolve())
+        return str((MODEL_ROOT / model_path).resolve())
+
     def _load_model(self, model_name):
-        print(f"Loading model: {model_name}")
-        model = YOLO(model_name)
+        model_path = self._resolve_model_path(model_name)
+        print(f"Loading model: {model_path}")
+        model = YOLO(model_path)
         model.to(self.device)
         return model
 

@@ -42,15 +42,20 @@ TouchDesigner network guideline
 
 import argparse
 import os
+import sys
 import threading
 import time
 from collections import Counter
+from pathlib import Path
 from urllib.parse import urlparse
 
 import cv2
 from pythonosc.udp_client import SimpleUDPClient
 
 from walnut_core import WalnutAnalyzer
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 COLOR_CODES = {
@@ -130,6 +135,14 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_project_path(path_value):
+    path = Path(path_value).expanduser()
+    resolved = path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    if not str(resolved).startswith(str(PROJECT_ROOT)):
+        raise ValueError(f"Path must stay inside project root: {resolved}")
+    return str(resolved)
+
+
 def split_rtsp_sources(rtsp_arg):
     sources = [item.strip() for item in rtsp_arg.split(",") if item.strip()]
     if not sources:
@@ -195,7 +208,15 @@ def create_capture(video_source, frame_width, frame_height):
     source_info = parse_video_source(video_source)
 
     if source_info["kind"] == "webcam":
-        cap = cv2.VideoCapture(source_info["capture_source"], cv2.CAP_DSHOW)
+        if sys.platform == "darwin":
+            backend = cv2.CAP_AVFOUNDATION
+        elif sys.platform == "win32":
+            backend = cv2.CAP_DSHOW
+        elif sys.platform.startswith("linux"):
+            backend = cv2.CAP_V4L2
+        else:
+            backend = 0
+        cap = cv2.VideoCapture(source_info["capture_source"], backend)
         if not cap.isOpened():
             cap = cv2.VideoCapture(source_info["capture_source"])
         cap.set(cv2.CAP_PROP_FPS, 30)
@@ -488,6 +509,16 @@ def build_clip_path(snapshot_root, visitor_id, cam_id, event_id):
     )
 
 
+def create_clip_writer(clip_path, fps, frame_size):
+    for codec in ("mp4v", "avc1", "H264", "MJPG"):
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        writer = cv2.VideoWriter(clip_path, fourcc, fps, frame_size)
+        if writer.isOpened():
+            return writer, codec
+        writer.release()
+    return None, None
+
+
 def get_region_color_name(person, region_name):
     profile = person.get("final_profile")
     if profile is not None:
@@ -728,9 +759,8 @@ class CameraWorker(threading.Thread):
     def _start_clip_recording(self, clip_path, frame):
         height, width = frame.shape[:2]
         fps = self._estimate_output_fps()
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(clip_path, fourcc, fps, (width, height))
-        if not writer.isOpened():
+        writer, codec = create_clip_writer(clip_path, fps, (width, height))
+        if writer is None:
             print(f"[cam {self.cam_id}] Failed to open clip writer: {clip_path}")
             return
 
@@ -743,7 +773,10 @@ class CameraWorker(threading.Thread):
                 "end_time": end_time,
             }
         )
-        print(f"[cam {self.cam_id}] Recording {self.args.clip_seconds:.1f}s clip: {clip_path}")
+        print(
+            f"[cam {self.cam_id}] Recording {self.args.clip_seconds:.1f}s clip "
+            f"with {codec}: {clip_path}"
+        )
 
     def _write_active_clips(self, frame):
         if not self.active_clip_recordings:
@@ -897,6 +930,7 @@ class CameraWorker(threading.Thread):
 
 def main():
     args = parse_args()
+    args.snapshot_dir = resolve_project_path(args.snapshot_dir)
     video_sources = split_rtsp_sources(args.rtsp)
     cam_types = split_cam_types(args.cam_types, len(video_sources))
 

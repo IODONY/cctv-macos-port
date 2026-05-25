@@ -1,10 +1,23 @@
 import csv
 import os
+import sys
 import time
+from pathlib import Path
 
 import cv2
 
 from walnut_core import WalnutAnalyzer
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def resolve_project_path(path_value):
+    path = Path(path_value).expanduser()
+    resolved = path.resolve() if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+    if not str(resolved).startswith(str(PROJECT_ROOT)):
+        raise ValueError(f"Path must stay inside project root: {resolved}")
+    return str(resolved)
 
 
 def ensure_log_file(log_path):
@@ -70,7 +83,16 @@ def append_log_rows(log_path, people):
 
 
 def configure_capture(camera_id, frame_width, frame_height):
-    cap = cv2.VideoCapture(camera_id, cv2.CAP_DSHOW)
+    if sys.platform == "darwin":
+        backend = cv2.CAP_AVFOUNDATION
+    elif sys.platform == "win32":
+        backend = cv2.CAP_DSHOW
+    elif sys.platform.startswith("linux"):
+        backend = cv2.CAP_V4L2
+    else:
+        backend = 0
+
+    cap = cv2.VideoCapture(camera_id, backend)
     if not cap.isOpened():
         cap = cv2.VideoCapture(camera_id)
 
@@ -200,7 +222,7 @@ def print_results(people, analyzer):
 
 def run_webcam_csv_case(
     camera_id=0,
-    log_path="visitor_log.csv",
+    log_path="data/visitor_log.csv",
     frame_width=640,
     frame_height=360,
     inference_interval=2,
@@ -216,6 +238,7 @@ def run_webcam_csv_case(
         vote_frame_window=75,
         track_max_missing=15,
     )
+    log_path = resolve_project_path(log_path)
     ensure_log_file(log_path)
 
     cap = configure_capture(camera_id, frame_width, frame_height)

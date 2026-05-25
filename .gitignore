@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Logs and runtime outputs
+logs/
+snapshots/
+.codex_trash/
+
+# Video and image test data
+data/test_videos/
+data/test_images/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.m4v
+
+# TouchDesigner temporary files
+*.toe.autosave
+*.toe~
+*.tox.autosave
+*.tox~
+
+# Local environment files
+.env
+.env.*
+*.local
+
+# Large generated outputs
+outputs/
+runs/

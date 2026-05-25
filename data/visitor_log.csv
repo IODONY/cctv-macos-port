@@ -1,0 +1,6 @@
+﻿timestamp,visitor_id,top,bottom,bag,is_long_sleeve,is_long_pants,shoulder-to-hip,brightness_ratio
+2026-05-24 22:12:09,1,blue,blue,no,long,long,1:0.619,0.9613
+2026-05-24 22:59:37,1,blue,blue,no,long,long,1:0.619,1.1569
+2026-05-24 23:05:03,3,blue,blue,no,long,long,1:0.618,1.1274
+2026-05-24 23:19:29,2,blue,blue,no,long,long,1:0.62,1.1623
+2026-05-24 23:20:10,1,red,gray,no,short,long,1:0.646,0.8663

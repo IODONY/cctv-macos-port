@@ -46,3 +46,6 @@ data/test_images/
 # Large generated outputs
 outputs/
 runs/
+
+# Raw import staging area
+import_here/

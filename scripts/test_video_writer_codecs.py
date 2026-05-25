@@ -9,14 +9,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import numpy as np
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_ROOT / "logs" / "codec_tests"
 
 
-def probe_codec(cv2, codec: str) -> dict[str, object]:
+def probe_codec(cv2, np, codec: str) -> dict[str, object]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ext = ".avi" if codec == "MJPG" else ".mp4"
     output = OUTPUT_DIR / f"codec_{codec.lower()}{ext}"
@@ -45,9 +43,14 @@ def probe_codec(cv2, codec: str) -> dict[str, object]:
 
 
 def main() -> int:
-    import cv2
+    try:
+        import cv2
+        import numpy as np
+    except Exception as exc:  # noqa: BLE001 - diagnostics should be explicit.
+        print(json.dumps({"ok": False, "error": repr(exc)}, indent=2, sort_keys=True))
+        return 1
 
-    results = [probe_codec(cv2, codec) for codec in ("mp4v", "avc1", "H264", "MJPG")]
+    results = [probe_codec(cv2, np, codec) for codec in ("mp4v", "avc1", "H264", "MJPG")]
     report = {"output_dir": str(OUTPUT_DIR), "results": results, "ok": any(r["ok"] for r in results)}
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ok"] else 1

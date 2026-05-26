@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
     parser.add_argument("--exposure-level", type=int, help="Set exposure compensation level before automatic WB on exit")
+    parser.add_argument("--exposure-type", default="manual", help="Exposure mode sent with exp_level; use auto to restore previous behavior")
     parser.add_argument("--exposure-step", type=int, default=DEFAULT_EXPOSURE_STEP, help="Exposure compensation step for -/= keys")
     parser.add_argument("--exposure-settle", type=float, default=0.2, help="Seconds to wait after exposure key changes")
     parser.add_argument("--exposure-min", type=int, help="Optional minimum exposure compensation level")
@@ -191,6 +192,7 @@ def adjust_exposure(
     print(f"[APPLY] exposure {current} -> {proposed}")
     result = client.apply_exposure_level(
         proposed,
+        exp_type=args.exposure_type,
         min_level=args.exposure_min,
         max_level=args.exposure_max,
     )
@@ -230,6 +232,7 @@ def apply_exposure_setting(args: argparse.Namespace, camera: Dict[str, Any], roi
     print(f"[APPLY] exposure -> {proposed}")
     result = client.apply_exposure_level(
         proposed,
+        exp_type=args.exposure_type,
         min_level=args.exposure_min,
         max_level=args.exposure_max,
     )
@@ -351,7 +354,7 @@ def apply_roi_on_exit(
         refresh_frame(args, camera, roi, state)
 
     common = ensure_client(camera, state).get_image_common()
-    summary = {k: common.get(k) for k in ("exp_level", "wb_type", "wb_R_gain", "wb_G_gain", "wb_B_gain") if k in common}
+    summary = {k: common.get(k) for k in ("exp_type", "exp_level", "wb_type", "wb_R_gain", "wb_G_gain", "wb_B_gain") if k in common}
     print(json.dumps({"readback_ok": True, "camera_ip": camera.get("ip"), "image_common": summary}, ensure_ascii=False, indent=2))
     return 0
 

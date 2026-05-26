@@ -51,7 +51,9 @@ and `=` to raise exposure; each keypress applies the exposure change and
 refreshes the preview. The default exposure step is 10, exposure key changes
 wait only 0.2 seconds before refresh, and queued repeated exposure keys are
 dropped so `q`/ESC can still close the picker. No software limit is applied
-unless `--exposure-min` or `--exposure-max` is provided.
+unless `--exposure-min` or `--exposure-max` is provided. ROI exposure changes
+send `exp_type=manual` by default; pass `--exposure-type auto` to restore the
+previous auto-exposure payload.
 
 ```bash
 TAPO_C210_1F_RTSP_URL='rtsp://CAMERA_RTSP_USER:CAMERA_RTSP_PASSWORD@CAMERA_IP:554/stream1' \

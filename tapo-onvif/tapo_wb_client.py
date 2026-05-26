@@ -17,8 +17,7 @@ from typing import Any, Dict, Optional
 from wb_core import clamp_gain, normalize_gains
 
 DEFAULT_SETTER_METHOD = "setDayNightModeConfig"
-DEFAULT_EXPOSURE_MIN = -3
-DEFAULT_EXPOSURE_MAX = 3
+DEFAULT_EXPOSURE_STEP = 10
 
 
 def default_backup_dir() -> Path:
@@ -47,16 +46,20 @@ def build_manual_wb_payload(gains: Dict[str, Any], wb_type: str = "manual") -> D
     }
 
 
-def clamp_exposure_level(value: Any, min_level: int = DEFAULT_EXPOSURE_MIN, max_level: int = DEFAULT_EXPOSURE_MAX) -> int:
+def clamp_exposure_level(value: Any, min_level: int | None = None, max_level: int | None = None) -> int:
     value_i = int(round(float(value)))
-    return max(min_level, min(max_level, value_i))
+    if min_level is not None:
+        value_i = max(int(min_level), value_i)
+    if max_level is not None:
+        value_i = min(int(max_level), value_i)
+    return value_i
 
 
 def build_exposure_payload(
     level: Any,
     exp_type: str = "auto",
-    min_level: int = DEFAULT_EXPOSURE_MIN,
-    max_level: int = DEFAULT_EXPOSURE_MAX,
+    min_level: int | None = None,
+    max_level: int | None = None,
 ) -> Dict[str, Any]:
     return {
         "image": {
@@ -112,8 +115,8 @@ class TapoWBClient:
         self,
         level: Any,
         exp_type: str = "auto",
-        min_level: int = DEFAULT_EXPOSURE_MIN,
-        max_level: int = DEFAULT_EXPOSURE_MAX,
+        min_level: int | None = None,
+        max_level: int | None = None,
     ) -> Dict[str, Any]:
         payload = build_exposure_payload(level, exp_type=exp_type, min_level=min_level, max_level=max_level)
         return self.tapo.executeFunction(self.setter_method, payload)

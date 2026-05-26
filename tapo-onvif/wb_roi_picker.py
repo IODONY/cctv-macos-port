@@ -34,8 +34,7 @@ from wb_core import (
     save_profiles,
 )
 from tapo_wb_client import (
-    DEFAULT_EXPOSURE_MAX,
-    DEFAULT_EXPOSURE_MIN,
+    DEFAULT_EXPOSURE_STEP,
     clamp_exposure_level,
     client_from_camera_profile,
     load_dotenv_if_available,
@@ -65,9 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
     parser.add_argument("--exposure-level", type=int, help="Set exposure compensation level before automatic WB on exit")
-    parser.add_argument("--exposure-step", type=int, default=1, help="Exposure compensation step for -/= keys")
-    parser.add_argument("--exposure-min", type=int, default=DEFAULT_EXPOSURE_MIN, help="Minimum exposure compensation level")
-    parser.add_argument("--exposure-max", type=int, default=DEFAULT_EXPOSURE_MAX, help="Maximum exposure compensation level")
+    parser.add_argument("--exposure-step", type=int, default=DEFAULT_EXPOSURE_STEP, help="Exposure compensation step for -/= keys")
+    parser.add_argument("--exposure-min", type=int, help="Optional minimum exposure compensation level")
+    parser.add_argument("--exposure-max", type=int, help="Optional maximum exposure compensation level")
     return parser
 
 
@@ -169,8 +168,8 @@ def adjust_exposure(
     step = max(1, abs(int(args.exposure_step)))
     proposed = clamp_exposure_level(
         int(current) + (step * int(direction)),
-        min_level=int(args.exposure_min),
-        max_level=int(args.exposure_max),
+        min_level=args.exposure_min,
+        max_level=args.exposure_max,
     )
     if proposed == current:
         state["message"] = f"exposure at limit: {current}"
@@ -179,8 +178,8 @@ def adjust_exposure(
     print(f"[APPLY] exposure {current} -> {proposed}")
     result = client.apply_exposure_level(
         proposed,
-        min_level=int(args.exposure_min),
-        max_level=int(args.exposure_max),
+        min_level=args.exposure_min,
+        max_level=args.exposure_max,
     )
     print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
     state["exposure_level"] = proposed
@@ -209,14 +208,14 @@ def apply_exposure_setting(args: argparse.Namespace, camera: Dict[str, Any], roi
     client = ensure_client(camera, state)
     proposed = clamp_exposure_level(
         args.exposure_level,
-        min_level=int(args.exposure_min),
-        max_level=int(args.exposure_max),
+        min_level=args.exposure_min,
+        max_level=args.exposure_max,
     )
     print(f"[APPLY] exposure -> {proposed}")
     result = client.apply_exposure_level(
         proposed,
-        min_level=int(args.exposure_min),
-        max_level=int(args.exposure_max),
+        min_level=args.exposure_min,
+        max_level=args.exposure_max,
     )
     print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
     state["exposure_level"] = proposed

@@ -32,7 +32,13 @@ from wb_core import (
     sample_roi_from_frame,
     save_profiles,
 )
-from tapo_wb_client import client_from_camera_profile, load_dotenv_if_available
+from tapo_wb_client import (
+    DEFAULT_EXPOSURE_MAX,
+    DEFAULT_EXPOSURE_MIN,
+    clamp_exposure_level,
+    client_from_camera_profile,
+    load_dotenv_if_available,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settle", type=float, default=1.5, help="Seconds to wait after applying gains before refreshing preview")
     parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
+    parser.add_argument("--exposure-step", type=int, default=1, help="Exposure compensation step for -/= keys")
+    parser.add_argument("--exposure-min", type=int, default=DEFAULT_EXPOSURE_MIN, help="Minimum exposure compensation level")
+    parser.add_argument("--exposure-max", type=int, default=DEFAULT_EXPOSURE_MAX, help="Maximum exposure compensation level")
     return parser
 
 
@@ -91,9 +100,9 @@ def overlay(
 
     lines = [
         "click: select white/neutral ROI",
-        "[/]: size  |  s: save/apply/preview  |  c: sample  |  r: refresh  |  q: quit"
+        "[/]: size  |  -/=: exposure  |  s: save/apply/preview  |  c: sample  |  r: refresh  |  q: quit"
         if apply_on_save
-        else "[/]: size  |  s: save  |  c: sample  |  r: refresh  |  q: quit",
+        else "[/]: size  |  -/=: exposure  |  s: save  |  c: sample  |  r: refresh  |  q: quit",
         f"ROI x={x} y={y} size={size}" + ("  *unsaved" if dirty else ""),
     ]
     if message:
@@ -113,6 +122,65 @@ def overlay(
         cv2.putText(vis, line, (16, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 0), 3, cv2.LINE_AA)
         cv2.putText(vis, line, (16, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
     return vis
+
+
+def ensure_client(camera: Dict[str, Any], state: Dict[str, Any]):
+    if state.get("client") is None:
+        state["client"] = client_from_camera_profile(camera)
+    if state.get("backup_path") is None:
+        state["backup_path"] = state["client"].backup_image_common()
+        print(f"[BACKUP] image.common saved to {state['backup_path']}")
+    return state["client"]
+
+
+def refresh_frame(args: argparse.Namespace, camera: Dict[str, Any], roi: Dict[str, Any], state: Dict[str, Any]) -> None:
+    refreshed = load_frame(args, camera)
+    state["frame"] = refreshed
+    state["height"], state["width"] = refreshed.shape[:2]
+    refreshed_roi = resolve_roi(roi, state["width"], state["height"])
+    state["x"] = refreshed_roi["x"]
+    state["y"] = refreshed_roi["y"]
+    state["size"] = refreshed_roi["size"]
+
+
+def adjust_exposure(
+    args: argparse.Namespace,
+    camera: Dict[str, Any],
+    roi: Dict[str, Any],
+    state: Dict[str, Any],
+    direction: int,
+) -> None:
+    if args.mock or args.image:
+        state["message"] = "exposure apply requires live camera"
+        return
+
+    client = ensure_client(camera, state)
+    current = state.get("exposure_level")
+    if current is None:
+        current = client.get_exposure_level()
+
+    step = max(1, abs(int(args.exposure_step)))
+    proposed = clamp_exposure_level(
+        int(current) + (step * int(direction)),
+        min_level=int(args.exposure_min),
+        max_level=int(args.exposure_max),
+    )
+    if proposed == current:
+        state["message"] = f"exposure at limit: {current}"
+        return
+
+    print(f"[APPLY] exposure {current} -> {proposed}")
+    result = client.apply_exposure_level(
+        proposed,
+        min_level=int(args.exposure_min),
+        max_level=int(args.exposure_max),
+    )
+    print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
+    state["exposure_level"] = proposed
+    time.sleep(max(0.0, min(float(args.settle), 1.5)))
+    refresh_frame(args, camera, roi, state)
+    state["stats"] = sample_roi_from_frame(state["frame"], roi, DEFAULT_ALGORITHM)
+    state["message"] = f"exposure applied: {proposed}"
 
 
 def apply_saved_roi(
@@ -143,11 +211,7 @@ def apply_saved_roi(
         print("[BLOCKED] ROI safety checks failed. Not applying. Use --force to override.")
         return stats
 
-    if state.get("client") is None:
-        state["client"] = client_from_camera_profile(camera)
-    if state.get("backup_path") is None:
-        state["backup_path"] = state["client"].backup_image_common()
-        print(f"[BACKUP] image.common saved to {state['backup_path']}")
+    ensure_client(camera, state)
 
     print(f"[APPLY] gains {gains} -> {proposed}")
     result = state["client"].apply_manual_wb_gains(proposed)
@@ -158,15 +222,9 @@ def apply_saved_roi(
     save_profiles(profile_path, profiles)
     time.sleep(max(0.0, args.settle))
 
-    refreshed = load_frame(args, camera)
-    state["frame"] = refreshed
-    state["height"], state["width"] = refreshed.shape[:2]
-    refreshed_roi = resolve_roi(roi, state["width"], state["height"])
-    state["x"] = refreshed_roi["x"]
-    state["y"] = refreshed_roi["y"]
-    state["size"] = refreshed_roi["size"]
+    refresh_frame(args, camera, roi, state)
     state["message"] = f"applied preview: R={proposed['R']} G={proposed['G']} B={proposed['B']}"
-    return sample_roi_from_frame(refreshed, roi, algorithm)
+    return sample_roi_from_frame(state["frame"], roi, algorithm)
 
 
 def main() -> int:
@@ -202,6 +260,7 @@ def main() -> int:
         "message": "",
         "client": None,
         "backup_path": None,
+        "exposure_level": None,
     }
     window = f"WB ROI Picker - {args.camera}/{args.angle}"
 
@@ -231,16 +290,15 @@ def main() -> int:
             state["size"] = int(state["size"]) + 2
             state["dirty"] = True
             state["message"] = ""
+        elif key == ord("-"):
+            adjust_exposure(args, camera, roi, state, direction=-1)
+        elif key in (ord("="), ord("+")):
+            adjust_exposure(args, camera, roi, state, direction=1)
         elif key == ord("c"):
             state["stats"] = sample_roi_from_frame(state["frame"], roi, DEFAULT_ALGORITHM)
             print(json.dumps(state["stats"], ensure_ascii=False, indent=2))
         elif key == ord("r"):
-            state["frame"] = load_frame(args, camera)
-            state["height"], state["width"] = state["frame"].shape[:2]
-            resolved = resolve_roi(roi, state["width"], state["height"])
-            state["x"] = resolved["x"]
-            state["y"] = resolved["y"]
-            state["size"] = resolved["size"]
+            refresh_frame(args, camera, roi, state)
             state["stats"] = None
             state["message"] = "preview refreshed"
         elif key == ord("s"):

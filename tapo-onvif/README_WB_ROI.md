@@ -41,7 +41,9 @@ Before applying changes, the current `image.common` response is backed up under
 
 For interactive preview, press `s` in the ROI picker with `--apply-on-save`.
 This saves the ROI, applies the proposed WB gain once, waits briefly, and
-refreshes the preview frame in the same window:
+refreshes the preview frame in the same window. Press `-` to lower exposure
+and `=` to raise exposure; each keypress applies the exposure change and
+refreshes the preview.
 
 ```bash
 TAPO_C210_1F_RTSP_URL='rtsp://CAMERA_RTSP_USER:CAMERA_RTSP_PASSWORD@CAMERA_IP:554/stream1' \

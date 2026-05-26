@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 from wb_core import clamp_gain, normalize_gains
 
 DEFAULT_SETTER_METHOD = "setDayNightModeConfig"
+DEFAULT_EXPOSURE_MIN = -3
+DEFAULT_EXPOSURE_MAX = 3
 
 
 def default_backup_dir() -> Path:
@@ -40,6 +42,27 @@ def build_manual_wb_payload(gains: Dict[str, Any], wb_type: str = "manual") -> D
                 "wb_R_gain": str(clamp_gain(normalized["R"])),
                 "wb_G_gain": str(clamp_gain(normalized["G"])),
                 "wb_B_gain": str(clamp_gain(normalized["B"])),
+            }
+        }
+    }
+
+
+def clamp_exposure_level(value: Any, min_level: int = DEFAULT_EXPOSURE_MIN, max_level: int = DEFAULT_EXPOSURE_MAX) -> int:
+    value_i = int(round(float(value)))
+    return max(min_level, min(max_level, value_i))
+
+
+def build_exposure_payload(
+    level: Any,
+    exp_type: str = "auto",
+    min_level: int = DEFAULT_EXPOSURE_MIN,
+    max_level: int = DEFAULT_EXPOSURE_MAX,
+) -> Dict[str, Any]:
+    return {
+        "image": {
+            "common": {
+                "exp_type": str(exp_type),
+                "exp_level": str(clamp_exposure_level(level, min_level=min_level, max_level=max_level)),
             }
         }
     }
@@ -79,6 +102,20 @@ class TapoWBClient:
 
     def apply_manual_wb_gains(self, gains: Dict[str, Any], wb_type: str = "manual") -> Dict[str, Any]:
         payload = build_manual_wb_payload(gains, wb_type=wb_type)
+        return self.tapo.executeFunction(self.setter_method, payload)
+
+    def get_exposure_level(self, default: int = 0) -> int:
+        common = self.get_image_common()
+        return clamp_exposure_level(common.get("exp_level", default))
+
+    def apply_exposure_level(
+        self,
+        level: Any,
+        exp_type: str = "auto",
+        min_level: int = DEFAULT_EXPOSURE_MIN,
+        max_level: int = DEFAULT_EXPOSURE_MAX,
+    ) -> Dict[str, Any]:
+        payload = build_exposure_payload(level, exp_type=exp_type, min_level=min_level, max_level=max_level)
         return self.tapo.executeFunction(self.setter_method, payload)
 
 

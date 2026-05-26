@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--settle", type=float, default=1.5, help="Seconds to wait after applying gains")
     parser.add_argument("--k", type=float, help="Override controller strength")
     parser.add_argument("--max-step", type=float, help="Override max gain step per iteration")
+    parser.add_argument("--target-kelvin", type=int, help="Target color temperature. Omit for neutral RGB.")
     return parser
 
 
@@ -75,6 +76,8 @@ def main() -> int:
         algorithm["k"] = args.k
     if args.max_step is not None:
         algorithm["max_step"] = args.max_step
+    if args.target_kelvin is not None:
+        algorithm["target_kelvin"] = args.target_kelvin
 
     if args.apply and (args.mock or args.image) and args.iterations > 1:
         print("[WARN] Static image/mock cannot reflect camera changes. Forcing iterations=1.")

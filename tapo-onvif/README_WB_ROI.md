@@ -35,9 +35,14 @@ python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entr
 python wb_auto_calibrate.py --profile wb_profiles.json --camera c210_1f --angle entrance --apply --iterations 5 --write-profile
 ```
 
-`--apply` is the only mode that contacts the camera through the local API.
-Before applying changes, the current `image.common` response is backed up under
-`/Users/fullcodex/CCTV_Project/logs/tapo_wb_backups/`.
+Live ROI picker mode now applies on exit by default: click the ROI, press `q`,
+then it saves the ROI, applies `--exposure-level` if provided, and iterates WB
+until the target Kelvin error is under threshold.
+
+```bash
+TAPO_C210_1F_RTSP_URL='rtsp://CAMERA_RTSP_USER:CAMERA_RTSP_PASSWORD@CAMERA_IP:554/stream1' \
+python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entrance --target-kelvin 6500 --exposure-level 0 --iterations 10
+```
 
 For interactive preview, press `s` in the ROI picker with `--apply-on-save`.
 This saves the ROI, applies the proposed WB gain once, waits briefly, and
@@ -52,3 +57,6 @@ python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entr
 
 Add `--force` only when you intentionally want to apply even if the ROI safety
 checks report clipping, darkness, or uneven patches.
+Use `--no-apply-on-exit` if you want the picker to close without final camera
+changes. Before applying changes, the current `image.common` response is backed
+up under `/Users/fullcodex/CCTV_Project/logs/tapo_wb_backups/`.

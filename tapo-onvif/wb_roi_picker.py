@@ -19,6 +19,7 @@ import cv2
 
 from wb_core import (
     DEFAULT_ALGORITHM,
+    DEFAULT_TARGET_KELVIN,
     compute_next_gains,
     create_mock_frame,
     ensure_camera_angle,
@@ -54,10 +55,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--size", type=int, default=5, help="ROI size in pixels; odd values are preferred")
     parser.add_argument("--headless-save", action="store_true", help="Save ROI from --x/--y/--size without opening UI")
     parser.add_argument("--apply-on-save", action="store_true", help="When s is pressed, save the ROI, apply proposed WB gains, and refresh the preview frame")
-    parser.add_argument("--force", action="store_true", help="With --apply-on-save, apply even if ROI safety checks fail")
+    parser.add_argument("--apply-on-exit", dest="apply_on_exit", action="store_true", default=True, help="When the picker closes, save the ROI and iteratively apply WB")
+    parser.add_argument("--no-apply-on-exit", dest="apply_on_exit", action="store_false", help="Close the picker without automatic final WB application")
+    parser.add_argument("--force", action="store_true", help="Apply even if ROI safety checks fail")
     parser.add_argument("--settle", type=float, default=1.5, help="Seconds to wait after applying gains before refreshing preview")
+    parser.add_argument("--iterations", type=int, default=10, help="Maximum WB iterations for automatic apply on exit")
+    parser.add_argument("--target-kelvin", type=int, default=DEFAULT_TARGET_KELVIN, help="Target color temperature for WB feedback")
+    parser.add_argument("--target-error", type=float, help="Override target neutral error threshold")
     parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
+    parser.add_argument("--exposure-level", type=int, help="Set exposure compensation level before automatic WB on exit")
     parser.add_argument("--exposure-step", type=int, default=1, help="Exposure compensation step for -/= keys")
     parser.add_argument("--exposure-min", type=int, default=DEFAULT_EXPOSURE_MIN, help="Minimum exposure compensation level")
     parser.add_argument("--exposure-max", type=int, default=DEFAULT_EXPOSURE_MAX, help="Maximum exposure compensation level")
@@ -102,7 +109,7 @@ def overlay(
         "click: select white/neutral ROI",
         "[/]: size  |  -/=: exposure  |  s: save/apply/preview  |  c: sample  |  r: refresh  |  q: quit"
         if apply_on_save
-        else "[/]: size  |  -/=: exposure  |  s: save  |  c: sample  |  r: refresh  |  q: quit",
+        else "[/]: size  |  -/=: exposure  |  s: save  |  c: sample  |  r: refresh  |  q: quit/apply",
         f"ROI x={x} y={y} size={size}" + ("  *unsaved" if dirty else ""),
     ]
     if message:
@@ -183,6 +190,41 @@ def adjust_exposure(
     state["message"] = f"exposure applied: {proposed}"
 
 
+def build_algorithm(args: argparse.Namespace, profiles: Dict[str, Any], camera: Dict[str, Any], angle: Dict[str, Any]) -> Dict[str, Any]:
+    algorithm = merged_algorithm(profiles, camera, angle)
+    if args.k is not None:
+        algorithm["k"] = args.k
+    if args.max_step is not None:
+        algorithm["max_step"] = args.max_step
+    if args.target_kelvin and args.target_kelvin > 0:
+        algorithm["target_kelvin"] = args.target_kelvin
+    if args.target_error is not None:
+        algorithm["neutral_error_threshold"] = args.target_error
+    return algorithm
+
+
+def apply_exposure_setting(args: argparse.Namespace, camera: Dict[str, Any], roi: Dict[str, Any], state: Dict[str, Any]) -> Optional[int]:
+    if args.exposure_level is None:
+        return None
+    client = ensure_client(camera, state)
+    proposed = clamp_exposure_level(
+        args.exposure_level,
+        min_level=int(args.exposure_min),
+        max_level=int(args.exposure_max),
+    )
+    print(f"[APPLY] exposure -> {proposed}")
+    result = client.apply_exposure_level(
+        proposed,
+        min_level=int(args.exposure_min),
+        max_level=int(args.exposure_max),
+    )
+    print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
+    state["exposure_level"] = proposed
+    time.sleep(max(0.0, min(float(args.settle), 1.5)))
+    refresh_frame(args, camera, roi, state)
+    return proposed
+
+
 def apply_saved_roi(
     args: argparse.Namespace,
     profile_path: Path,
@@ -193,11 +235,7 @@ def apply_saved_roi(
     frame: Any,
     state: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    algorithm = merged_algorithm(profiles, camera, angle)
-    if args.k is not None:
-        algorithm["k"] = args.k
-    if args.max_step is not None:
-        algorithm["max_step"] = args.max_step
+    algorithm = build_algorithm(args, profiles, camera, angle)
 
     stats = sample_roi_from_frame(frame, roi, algorithm)
     gains = dict(angle.get("gains") or camera.get("gains") or {"R": 50, "G": 50, "B": 50})
@@ -227,11 +265,88 @@ def apply_saved_roi(
     return sample_roi_from_frame(state["frame"], roi, algorithm)
 
 
+def apply_roi_on_exit(
+    args: argparse.Namespace,
+    profile_path: Path,
+    profiles: Dict[str, Any],
+    camera: Dict[str, Any],
+    angle: Dict[str, Any],
+    state: Dict[str, Any],
+) -> int:
+    roi = save_roi_to_profile(
+        profile_path,
+        profiles,
+        args.camera,
+        args.angle,
+        state["frame"],
+        state["x"],
+        state["y"],
+        state["size"],
+    )
+    print(json.dumps({"saved_roi": roi, "profile": str(profile_path)}, ensure_ascii=False, indent=2))
+
+    algorithm = build_algorithm(args, profiles, camera, angle)
+    report = {
+        "camera": args.camera,
+        "angle": args.angle,
+        "target_kelvin": algorithm.get("target_kelvin"),
+        "target_error": algorithm["neutral_error_threshold"],
+        "exposure_level": None,
+        "iterations": [],
+    }
+
+    if args.exposure_level is not None:
+        report["exposure_level"] = apply_exposure_setting(args, camera, roi, state)
+
+    gains = dict(angle.get("gains") or camera.get("gains") or {"R": 50, "G": 50, "B": 50})
+    max_iterations = max(1, int(args.iterations))
+    for index in range(max_iterations):
+        stats = sample_roi_from_frame(state["frame"], roi, algorithm)
+        proposed, details = compute_next_gains(stats["median_rgb"], gains, algorithm)
+        row = {"iteration": index + 1, "stats": stats, "details": details, "proposed_gains": proposed}
+        report["iterations"].append(row)
+
+        print("\n=== ROI exit WB calibration step ===")
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+
+        if not stats["ok_to_adjust"] and not args.force:
+            print("[BLOCKED] ROI safety checks failed. Not applying. Use --force to override.")
+            angle["last_roi_picker_exit_apply"] = report
+            save_profiles(profile_path, profiles)
+            return 2
+
+        ensure_client(camera, state)
+        print(f"[APPLY] gains {gains} -> {proposed}")
+        result = state["client"].apply_manual_wb_gains(proposed)
+        print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
+
+        gains = proposed
+        angle["gains"] = gains
+        angle["last_roi_picker_exit_apply"] = report
+        save_profiles(profile_path, profiles)
+
+        if float(stats["neutral_error"]) <= float(algorithm["neutral_error_threshold"]):
+            print("[OK] Target Kelvin error is under threshold.")
+            break
+
+        time.sleep(max(0.0, float(args.settle)))
+        refresh_frame(args, camera, roi, state)
+
+    common = ensure_client(camera, state).get_image_common()
+    summary = {k: common.get(k) for k in ("exp_level", "wb_type", "wb_R_gain", "wb_G_gain", "wb_B_gain") if k in common}
+    print(json.dumps({"readback_ok": True, "camera_ip": camera.get("ip"), "image_common": summary}, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     load_dotenv_if_available()
     args = build_parser().parse_args()
     if args.apply_on_save and (args.mock or args.image):
         raise SystemExit("--apply-on-save requires a live camera frame; do not use --mock or --image")
+    if args.apply_on_exit and (args.mock or args.image):
+        if not args.headless_save:
+            print("[WARN] --apply-on-exit ignored for mock/image mode.")
+        args.apply_on_exit = False
 
     profile_path = Path(args.profile)
     profiles = load_profiles_or_empty(profile_path)
@@ -319,6 +434,8 @@ def main() -> int:
                 state["stats"] = apply_saved_roi(args, profile_path, profiles, camera, angle, saved, state["frame"], state)
 
     cv2.destroyAllWindows()
+    if args.apply_on_exit:
+        return apply_roi_on_exit(args, profile_path, profiles, camera, angle, state)
     return 0
 
 

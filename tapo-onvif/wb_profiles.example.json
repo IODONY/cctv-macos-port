@@ -13,7 +13,8 @@
       "max_clipped_ratio": 0.2,
       "max_dark_ratio": 0.5,
       "max_patch_std": 35.0,
-      "neutral_error_threshold": 0.04
+      "neutral_error_threshold": 0.04,
+      "target_kelvin": null
     }
   },
   "cameras": {

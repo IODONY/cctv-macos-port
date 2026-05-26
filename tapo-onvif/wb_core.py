@@ -19,6 +19,7 @@ import numpy as np
 
 DEFAULT_GAINS: Dict[str, int] = {"R": 50, "G": 50, "B": 50}
 DEFAULT_ROI_SIZE = 5
+DEFAULT_TARGET_KELVIN = 6500
 DEFAULT_ALGORITHM: Dict[str, Any] = {
     "k": 18.0,
     "max_step": 4,
@@ -32,6 +33,7 @@ DEFAULT_ALGORITHM: Dict[str, Any] = {
     "max_dark_ratio": 0.5,
     "max_patch_std": 35.0,
     "neutral_error_threshold": 0.04,
+    "target_kelvin": None,
 }
 
 
@@ -213,7 +215,8 @@ def sample_roi_from_frame(frame_bgr: np.ndarray, roi: Dict[str, Any], algorithm:
     mean_rgb = np.mean(valid_pixels, axis=0)
     std_rgb = np.std(valid_pixels, axis=0)
     patch_std = float(np.mean(std_rgb))
-    neutral = neutral_error(median_rgb)
+    target_kelvin = algo.get("target_kelvin")
+    neutral = neutral_error(median_rgb, target_kelvin=target_kelvin)
 
     reasons = []
     if valid_ratio < float(algo["min_valid_ratio"]):
@@ -240,19 +243,50 @@ def sample_roi_from_frame(frame_bgr: np.ndarray, roi: Dict[str, Any], algorithm:
         "neutral_error": round(float(neutral["error"]), 6),
         "r_over_g_minus_1": round(float(neutral["r_over_g_minus_1"]), 6),
         "b_over_g_minus_1": round(float(neutral["b_over_g_minus_1"]), 6),
+        "target_kelvin": target_kelvin,
+        "target_r_over_g": round(float(neutral["target_r_over_g"]), 6),
+        "target_b_over_g": round(float(neutral["target_b_over_g"]), 6),
         "ok_to_adjust": len(reasons) == 0,
         "reasons": reasons,
     }
 
 
-def neutral_error(rgb: Any) -> Dict[str, float]:
+def kelvin_to_rgb(kelvin: Any) -> Tuple[float, float, float]:
+    """Approximate color temperature as sRGB values in 0..255.
+
+    The camera API exposes RGB gain, not Kelvin directly, so this is used only
+    to derive target R/G and B/G ratios for the feedback controller.
+    """
+    temp = max(1000.0, min(40000.0, float(kelvin))) / 100.0
+    if temp <= 66.0:
+        red = 255.0
+        green = 99.4708025861 * math.log(temp) - 161.1195681661
+        blue = 0.0 if temp <= 19.0 else 138.5177312231 * math.log(temp - 10.0) - 305.0447927307
+    else:
+        red = 329.698727446 * ((temp - 60.0) ** -0.1332047592)
+        green = 288.1221695283 * ((temp - 60.0) ** -0.0755148492)
+        blue = 255.0
+    return tuple(max(1.0, min(255.0, float(v))) for v in (red, green, blue))
+
+
+def target_ratios_for_kelvin(kelvin: Any = None) -> Dict[str, float]:
+    if kelvin is None:
+        return {"r_over_g": 1.0, "b_over_g": 1.0}
+    r, g, b = kelvin_to_rgb(kelvin)
+    return {"r_over_g": r / g, "b_over_g": b / g}
+
+
+def neutral_error(rgb: Any, target_kelvin: Any = None) -> Dict[str, float]:
     arr = np.asarray(rgb, dtype=np.float32)
     r, g, b = [max(1.0, float(v)) for v in arr[:3]]
-    r_err = r / g - 1.0
-    b_err = b / g - 1.0
+    target = target_ratios_for_kelvin(target_kelvin)
+    r_err = (r / g) - target["r_over_g"]
+    b_err = (b / g) - target["b_over_g"]
     return {
         "r_over_g_minus_1": r_err,
         "b_over_g_minus_1": b_err,
+        "target_r_over_g": target["r_over_g"],
+        "target_b_over_g": target["b_over_g"],
         "error": max(abs(r_err), abs(b_err)),
     }
 
@@ -272,10 +306,12 @@ def compute_next_gains(
     max_step = float(algo["max_step"])
     min_gain = int(algo["min_gain"])
     max_gain = int(algo["max_gain"])
+    target_kelvin = algo.get("target_kelvin")
+    target = target_ratios_for_kelvin(target_kelvin)
 
-    # Keep G fixed at first. Move R/B toward G using a log-ratio controller.
-    raw_delta_r = math.log(g / r) * k
-    raw_delta_b = math.log(g / b) * k
+    # Keep G fixed. Move R/B toward the target R/G and B/G ratios.
+    raw_delta_r = math.log((g * target["r_over_g"]) / r) * k
+    raw_delta_b = math.log((g * target["b_over_g"]) / b) * k
     delta_r = max(-max_step, min(max_step, raw_delta_r))
     delta_b = max(-max_step, min(max_step, raw_delta_b))
 
@@ -289,8 +325,10 @@ def compute_next_gains(
         "next_gains": next_gains,
         "delta": {"R": round(delta_r, 3), "G": 0, "B": round(delta_b, 3)},
         "raw_delta": {"R": round(raw_delta_r, 3), "G": 0, "B": round(raw_delta_b, 3)},
-        "neutral_error": neutral_error([r, g, b]),
-        "algorithm": {k: algo[k] for k in ("k", "max_step", "min_gain", "max_gain", "neutral_error_threshold")},
+        "neutral_error": neutral_error([r, g, b], target_kelvin=target_kelvin),
+        "target_kelvin": target_kelvin,
+        "target_ratios": target,
+        "algorithm": {k: algo[k] for k in ("k", "max_step", "min_gain", "max_gain", "neutral_error_threshold", "target_kelvin")},
     }
     return next_gains, details
 

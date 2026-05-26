@@ -48,8 +48,10 @@ For interactive preview, press `s` in the ROI picker with `--apply-on-save`.
 This saves the ROI, applies the proposed WB gain once, waits briefly, and
 refreshes the preview frame in the same window. Press `-` to lower exposure
 and `=` to raise exposure; each keypress applies the exposure change and
-refreshes the preview. The default exposure step is 10 and no software limit is
-applied unless `--exposure-min` or `--exposure-max` is provided.
+refreshes the preview. The default exposure step is 10, exposure key changes
+wait only 0.2 seconds before refresh, and queued repeated exposure keys are
+dropped so `q`/ESC can still close the picker. No software limit is applied
+unless `--exposure-min` or `--exposure-max` is provided.
 
 ```bash
 TAPO_C210_1F_RTSP_URL='rtsp://CAMERA_RTSP_USER:CAMERA_RTSP_PASSWORD@CAMERA_IP:554/stream1' \
@@ -59,5 +61,7 @@ python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entr
 Add `--force` only when you intentionally want to apply even if the ROI safety
 checks report clipping, darkness, or uneven patches.
 Use `--no-apply-on-exit` if you want the picker to close without final camera
-changes. Before applying changes, the current `image.common` response is backed
-up under `/Users/fullcodex/CCTV_Project/logs/tapo_wb_backups/`.
+changes. If you run without `--exposure-level`, the last exposure value adjusted
+with `-`/`=` is saved to the profile on exit. Before applying changes, the
+current `image.common` response is backed up under
+`/Users/fullcodex/CCTV_Project/logs/tapo_wb_backups/`.

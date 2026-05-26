@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
     parser.add_argument("--exposure-level", type=int, help="Set exposure compensation level before automatic WB on exit")
     parser.add_argument("--exposure-step", type=int, default=DEFAULT_EXPOSURE_STEP, help="Exposure compensation step for -/= keys")
+    parser.add_argument("--exposure-settle", type=float, default=0.2, help="Seconds to wait after exposure key changes")
     parser.add_argument("--exposure-min", type=int, help="Optional minimum exposure compensation level")
     parser.add_argument("--exposure-max", type=int, help="Optional maximum exposure compensation level")
     return parser
@@ -139,6 +140,18 @@ def ensure_client(camera: Dict[str, Any], state: Dict[str, Any]):
     return state["client"]
 
 
+def drain_pending_keys(duration: float = 0.15) -> set[int]:
+    """Drop queued key repeats after slow camera operations, but preserve quit."""
+    keys = set()
+    deadline = time.time() + max(0.0, duration)
+    while time.time() < deadline:
+        key = cv2.waitKey(1)
+        if key == -1:
+            break
+        keys.add(key & 0xFF)
+    return keys
+
+
 def refresh_frame(args: argparse.Namespace, camera: Dict[str, Any], roi: Dict[str, Any], state: Dict[str, Any]) -> None:
     refreshed = load_frame(args, camera)
     state["frame"] = refreshed
@@ -183,10 +196,13 @@ def adjust_exposure(
     )
     print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
     state["exposure_level"] = proposed
-    time.sleep(max(0.0, min(float(args.settle), 1.5)))
+    time.sleep(max(0.0, float(args.exposure_settle)))
     refresh_frame(args, camera, roi, state)
     state["stats"] = sample_roi_from_frame(state["frame"], roi, DEFAULT_ALGORITHM)
     state["message"] = f"exposure applied: {proposed}"
+    pending = drain_pending_keys()
+    if ord("q") in pending or 27 in pending:
+        state["quit_requested"] = True
 
 
 def build_algorithm(args: argparse.Namespace, profiles: Dict[str, Any], camera: Dict[str, Any], angle: Dict[str, Any]) -> Dict[str, Any]:
@@ -290,12 +306,15 @@ def apply_roi_on_exit(
         "angle": args.angle,
         "target_kelvin": algorithm.get("target_kelvin"),
         "target_error": algorithm["neutral_error_threshold"],
-        "exposure_level": None,
+        "exposure_level": state.get("exposure_level"),
         "iterations": [],
     }
 
     if args.exposure_level is not None:
         report["exposure_level"] = apply_exposure_setting(args, camera, roi, state)
+    elif state.get("exposure_level") is not None:
+        angle["exposure_level"] = state["exposure_level"]
+        save_profiles(profile_path, profiles)
 
     gains = dict(angle.get("gains") or camera.get("gains") or {"R": 50, "G": 50, "B": 50})
     max_iterations = max(1, int(args.iterations))
@@ -375,6 +394,7 @@ def main() -> int:
         "client": None,
         "backup_path": None,
         "exposure_level": None,
+        "quit_requested": False,
     }
     window = f"WB ROI Picker - {args.camera}/{args.angle}"
 
@@ -391,6 +411,8 @@ def main() -> int:
     cv2.setMouseCallback(window, on_mouse)
 
     while True:
+        if state.get("quit_requested"):
+            break
         roi = make_roi(state["x"], state["y"], state["size"], state["width"], state["height"])
         cv2.imshow(window, overlay(state["frame"], roi, state["stats"], state["dirty"], args.apply_on_save, state["message"]))
         key = cv2.waitKey(30) & 0xFF

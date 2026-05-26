@@ -19,22 +19,74 @@ This is appearance-based retrieval. The live runtime does not know identity labe
 
 Use environment variables for Tapo RTSP URLs. Do not commit RTSP credentials.
 
-Example:
+Current 5-camera gallery test mapping:
 
-```bash
-export TAPO_1F_RTSP_URL='rtsp://...'
-export TAPO_2F_RTSP_URL='rtsp://...'
+| runtime role | physical camera | IP address | label |
+| --- | ---: | --- | --- |
+| gallery | 1 | `192.168.1.12` | `tapo_1` |
+| gallery | 2 | `192.168.1.6` | `tapo_2` |
+| gallery | 3 | `192.168.1.8` | `tapo_3` |
+| gallery | 5 | `192.168.1.7` | `tapo_5` |
+| gallery | 9 | `192.168.1.9` | `tapo_9` |
+| query | MacBook internal camera | `webcam:0` | `macbook_query` |
+
+Set RTSP URLs in the local shell only. The URL pattern is:
+
+```text
+rtsp://<camera-user>:<camera-password>@192.168.1.<ip-suffix>
 ```
 
-Run gallery Tapo cameras plus the MacBook internal camera:
+Example local setup:
+
+```bash
+export TAPO_CAM_1_RTSP_URL='rtsp://<user>:<password>@192.168.1.12'
+export TAPO_CAM_2_RTSP_URL='rtsp://<user>:<password>@192.168.1.6'
+export TAPO_CAM_3_RTSP_URL='rtsp://<user>:<password>@192.168.1.8'
+export TAPO_CAM_5_RTSP_URL='rtsp://<user>:<password>@192.168.1.7'
+export TAPO_CAM_9_RTSP_URL='rtsp://<user>:<password>@192.168.1.9'
+```
+
+If a base RTSP URL does not open for a specific Tapo model, try the same environment variable with `/stream1` or `/stream2` appended.
+
+## Smoke Tests
+
+First test one camera for one minute:
 
 ```bash
 source .venv/bin/activate
 python src/live_topk_bridge.py \
-  --rtsp-envs TAPO_1F_RTSP_URL,TAPO_2F_RTSP_URL \
+  --rtsp-envs TAPO_CAM_1_RTSP_URL \
+  --cam-types G \
+  --cam-labels tapo_1 \
+  --max-runtime-seconds 60 \
+  --disable-osc
+```
+
+Then test all five gallery cameras:
+
+```bash
+source .venv/bin/activate
+python src/live_topk_bridge.py \
+  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL,TAPO_CAM_5_RTSP_URL,TAPO_CAM_9_RTSP_URL \
+  --cam-types G,G,G,G,G \
+  --cam-labels tapo_1,tapo_2,tapo_3,tapo_5,tapo_9 \
+  --max-runtime-seconds 120 \
+  --disable-osc
+```
+
+Finally run five Tapo gallery cameras plus the MacBook query camera. This test does not require TouchDesigner; every query event exports the selected clips into the workspace.
+
+```bash
+source .venv/bin/activate
+python src/live_topk_bridge.py \
+  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL,TAPO_CAM_5_RTSP_URL,TAPO_CAM_9_RTSP_URL \
   --rtsp webcam:0 \
-  --cam-types G,G,Q \
-  --topk 9
+  --cam-types G,G,G,G,G,Q \
+  --cam-labels tapo_1,tapo_2,tapo_3,tapo_5,tapo_9,macbook_query \
+  --topk 7 \
+  --export-topk-dir snapshots/topk_exports \
+  --export-mode symlink \
+  --disable-osc
 ```
 
 Roles:
@@ -56,11 +108,18 @@ Generated runtime files stay under ignored folders:
 
 - `snapshots/live_topk/<session>/cam_N/*.mp4`: cropped per-person track clips.
 - `snapshots/live_topk/<session>/cam_N/*_best.jpg`: best ReID crop per track.
+- `snapshots/topk_exports/<session>/<query_id>/results.json`: ranked clips selected for one MacBook query event.
+- `snapshots/topk_exports/<session>/<query_id>/query_best.jpg`: query crop used for ranking.
+- `snapshots/topk_exports/<session>/<query_id>/rank_01/clip.mp4`: symlink or copy of the selected clip, depending on `--export-mode`.
+- `snapshots/topk_exports/<session>/<query_id>/rank_01/best.jpg`: symlink or copy of the selected gallery best frame.
+- `snapshots/topk_exports/<session>/<query_id>/rank_01/score.json`: score and metadata for that rank.
 - `logs/topk_live/<session>/gallery_events.jsonl`: gallery record metadata.
 - `logs/topk_live/<session>/query_results.jsonl`: query Top-K results.
 - `logs/model_cache/torch`: local pretrained model cache.
 
 These files should not be committed.
+
+`--export-mode symlink` is preferred on the MacBook because it avoids duplicating video data. Use `--export-mode copy` only if another app cannot follow symlinks. Use `--export-mode path` to write path text files only.
 
 ## TouchDesigner
 
@@ -101,6 +160,9 @@ Important CLI parameters:
 - `--max-clip-seconds 30`: safety cutoff for very long tracks.
 - `--clip-width 320 --clip-height 640`: cropped person clip resolution.
 - `--fallback-score 0.55`: score below which a result is considered fallback.
+- `--cam-labels ...`: physical camera labels that stay attached to logs, exports, and OSC side channels.
+- `--export-topk-dir snapshots/topk_exports`: query-by-query export bundles for TouchDesigner-free testing.
+- `--disable-osc`: skip all OSC traffic during camera-only validation.
 
 If Top-9 contains too many wrong clips, inspect:
 

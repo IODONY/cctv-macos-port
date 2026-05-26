@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -28,6 +29,12 @@ import cv2
 import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
 
+from visual_reid import (
+    TorchvisionEmbedder,
+    crop_person as visual_crop_person,
+    crop_quality as visual_crop_quality,
+    resize_with_padding as visual_resize_with_padding,
+)
 from walnut_core import WalnutAnalyzer
 
 
@@ -59,9 +66,15 @@ def parse_args() -> argparse.Namespace:
             "Use G/A/B for gallery cameras and Q/C for query cameras."
         ),
     )
+    parser.add_argument(
+        "--cam-labels",
+        default="",
+        help='Comma-separated physical/source labels matching source order. Example: "tapo_1,tapo_2,macbook_query".',
+    )
     parser.add_argument("--osc-host", default="127.0.0.1")
     parser.add_argument("--osc-port", type=int, default=7000)
     parser.add_argument("--osc-dry-run", action="store_true", help="Print OSC payloads instead of sending UDP.")
+    parser.add_argument("--disable-osc", action="store_true", help="Do not send OSC messages.")
     parser.add_argument("--frame-width", type=int, default=1280)
     parser.add_argument("--frame-height", type=int, default=720)
     parser.add_argument("--inference-interval", type=int, default=2)
@@ -81,6 +94,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=9)
     parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument("--export-topk-dir", default="", help="Optional directory for query-by-query Top-K exports.")
+    parser.add_argument(
+        "--export-mode",
+        choices=("symlink", "copy", "path"),
+        default="symlink",
+        help="How to place selected clips in the Top-K export folder.",
+    )
     parser.add_argument(
         "--fallback-score",
         type=float,
@@ -141,6 +161,17 @@ def split_cam_types(cam_types_arg: str, camera_count: int) -> list[str]:
     if len(cam_types) != camera_count:
         raise ValueError(f"--cam-types count ({len(cam_types)}) must match source count ({camera_count}).")
     return cam_types
+
+
+def split_cam_labels(cam_labels_arg: str, camera_count: int) -> list[str]:
+    if not cam_labels_arg.strip():
+        return [f"cam_{index}" for index in range(1, camera_count + 1)]
+    labels = [sanitize_id(item) for item in split_csv(cam_labels_arg)]
+    if len(labels) != camera_count:
+        raise ValueError(f"--cam-labels count ({len(labels)}) must match source count ({camera_count}).")
+    if len(set(labels)) != len(labels):
+        raise ValueError("--cam-labels values must be unique.")
+    return labels
 
 
 def parse_video_source(source: str) -> dict[str, object]:
@@ -231,6 +262,44 @@ def sanitize_id(value: object) -> str:
     return text.strip("_") or "unknown"
 
 
+def write_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def export_asset(source_path: str, destination: Path, mode: str, path_txt_name: str) -> str:
+    if not str(source_path or "").strip():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        path_txt = destination.parent / path_txt_name
+        path_txt.write_text("", encoding="utf-8")
+        return str(path_txt.resolve()).replace("\\", "/")
+
+    source = Path(str(source_path)).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    path_txt = destination.parent / path_txt_name
+    path_txt.write_text(str(source), encoding="utf-8")
+
+    if mode == "path":
+        return str(path_txt.resolve()).replace("\\", "/")
+    if not source.exists():
+        return str(path_txt.resolve()).replace("\\", "/")
+
+    if destination.exists() or destination.is_symlink():
+        destination.unlink()
+
+    if mode == "copy":
+        shutil.copy2(source, destination)
+    else:
+        try:
+            relative_source = os.path.relpath(source.resolve(), start=destination.parent.resolve())
+            destination.symlink_to(relative_source)
+        except OSError:
+            shutil.copy2(source, destination)
+    return str((destination.parent.resolve() / destination.name)).replace("\\", "/")
+
+
 def crop_person(frame: np.ndarray, box: Iterable[int], expand_ratio: float = 0.08) -> np.ndarray | None:
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -277,78 +346,13 @@ def crop_quality(crop: np.ndarray | None, person: dict[str, object]) -> float:
     return (confidence * 0.45) + (sharpness * 0.30) + (area_score * 0.25)
 
 
-class AppearanceEmbedder:
+class AppearanceEmbedder(TorchvisionEmbedder):
     def __init__(self, cache_root: Path = MODEL_CACHE_ROOT):
-        self.cache_root = cache_root
-        self.cache_root.mkdir(parents=True, exist_ok=True)
-        os.environ.setdefault("TORCH_HOME", str(self.cache_root))
-        self.lock = threading.Lock()
-        self.model = None
-        self.preprocess = None
-        self.device = "cpu"
-        self.method = "hsv_histogram"
-        self._torch_failed = False
-        self._load_torchvision_model()
-
-    def _load_torchvision_model(self) -> None:
-        try:
-            import torch
-            from torchvision.models import MobileNet_V3_Large_Weights, mobilenet_v3_large
-        except Exception as exc:  # noqa: BLE001 - runtime fallback should stay alive.
-            print(f"[reid] torchvision embedding unavailable; using HSV fallback: {exc!r}")
-            return
-
-        if torch.cuda.is_available():
-            self.device = "cuda:0"
-        elif getattr(getattr(torch, "backends", None), "mps", None) is not None and torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-
-        try:
-            weights = MobileNet_V3_Large_Weights.DEFAULT
-            model = mobilenet_v3_large(weights=weights)
-            model.classifier = torch.nn.Identity()
-            model.eval().to(self.device)
-            self.model = model
-            self.preprocess = weights.transforms()
-            self.method = "torchvision_mobilenet_v3_large"
-            print(f"[reid] Loaded {self.method} on {self.device}; cache={self.cache_root}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[reid] Failed to load torchvision model; using HSV fallback: {exc!r}")
-            self.model = None
-            self.preprocess = None
-            self.method = "hsv_histogram"
-
-    def embed_bgr(self, image_bgr: np.ndarray | None) -> tuple[np.ndarray | None, str]:
-        if image_bgr is None or image_bgr.size == 0:
-            return None, self.method
-        if self.model is not None and not self._torch_failed:
-            embedding = self._embed_torch(image_bgr)
-            if embedding is not None:
-                return embedding, self.method
-        return self._embed_histogram(image_bgr), "hsv_histogram"
-
-    def _embed_torch(self, image_bgr: np.ndarray) -> np.ndarray | None:
-        try:
-            import torch
-            from PIL import Image
-
-            image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            pil_image = Image.fromarray(image_rgb)
-            tensor = self.preprocess(pil_image).unsqueeze(0).to(self.device)
-            with self.lock, torch.inference_mode():
-                features = self.model(tensor).detach().float().cpu().numpy().reshape(-1)
-            return normalize_vector(features)
-        except Exception as exc:  # noqa: BLE001
-            self._torch_failed = True
-            print(f"[reid] Torch embedding failed once; switching to HSV fallback: {exc!r}")
-            return None
-
-    def _embed_histogram(self, image_bgr: np.ndarray) -> np.ndarray | None:
-        hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 4], [0, 180, 0, 256, 0, 256])
-        return normalize_vector(hist.reshape(-1))
+        super().__init__(
+            model_name="mobilenet_v3_large",
+            cache_root=cache_root,
+            color_weight=0.20,
+        )
 
 
 @dataclass
@@ -357,6 +361,7 @@ class GalleryRecord:
     clip_path: str
     best_frame_path: str
     cam_id: str
+    cam_label: str
     event_id: str
     track_id: int
     created_at: float
@@ -372,6 +377,7 @@ class GalleryRecord:
             "clip_path": self.clip_path,
             "best_frame_path": self.best_frame_path,
             "cam_id": self.cam_id,
+            "cam_label": self.cam_label,
             "event_id": self.event_id,
             "track_id": self.track_id,
             "created_at": self.created_at,
@@ -431,6 +437,7 @@ class LiveTopKGallery:
                     "best_frame_path": record.best_frame_path,
                     "score": score,
                     "cam_id": record.cam_id,
+                    "cam_label": record.cam_label,
                     "event_id": record.event_id,
                     "track_id": record.track_id,
                     "fallback": bool(score < fallback_score),
@@ -459,6 +466,7 @@ class PersonClipRecorder:
         session_id: str,
         snapshot_root: Path,
         cam_id: int,
+        cam_label: str,
         track_id: int,
         output_size: tuple[int, int],
         fps: float,
@@ -471,6 +479,7 @@ class PersonClipRecorder:
         self.clip_id = clip_id
         self.event_id = event_id
         self.cam_id = safe_cam
+        self.cam_label = sanitize_id(cam_label)
         self.track_id = int(track_id)
         self.clip_path = clip_dir / f"{clip_id}.mp4"
         self.best_frame_path = clip_dir / f"{clip_id}_best.jpg"
@@ -494,8 +503,8 @@ class PersonClipRecorder:
         self.last_box = tuple(int(value) for value in person["box"])
         self.last_person = person
         self.missing_analyses = 0
-        crop = crop_person(frame, self.last_box)
-        quality = crop_quality(crop, person)
+        crop = visual_crop_person(frame, self.last_box)
+        quality = visual_crop_quality(crop, person, frame.shape)
         if crop is not None and quality > self.best_quality:
             self.best_crop = crop
             self.best_quality = quality
@@ -503,10 +512,10 @@ class PersonClipRecorder:
     def write_frame(self, frame: np.ndarray) -> None:
         if self.writer is None or self.last_box is None or self.closed:
             return
-        crop = crop_person(frame, self.last_box)
+        crop = visual_crop_person(frame, self.last_box)
         if crop is None:
             return
-        self.writer.write(resize_with_padding(crop, self.output_size))
+        self.writer.write(visual_resize_with_padding(crop, self.output_size))
         self.frame_count += 1
 
     def should_force_close(self, max_clip_seconds: float) -> bool:
@@ -541,6 +550,7 @@ class PersonClipRecorder:
             clip_path=str(self.clip_path.resolve()).replace("\\", "/"),
             best_frame_path=str(self.best_frame_path.resolve()).replace("\\", "/"),
             cam_id=self.cam_id,
+            cam_label=self.cam_label,
             event_id=self.event_id,
             track_id=self.track_id,
             created_at=self.created_at,
@@ -553,13 +563,16 @@ class PersonClipRecorder:
 
 
 class OscSender:
-    def __init__(self, host: str, port: int, dry_run: bool):
+    def __init__(self, host: str, port: int, dry_run: bool, disabled: bool = False):
         self.host = host
         self.port = int(port)
         self.dry_run = bool(dry_run)
-        self.client = None if dry_run else SimpleUDPClient(host, int(port))
+        self.disabled = bool(disabled)
+        self.client = None if (dry_run or disabled) else SimpleUDPClient(host, int(port))
 
     def send(self, address: str, payload):
+        if self.disabled:
+            return
         if self.dry_run:
             print(json.dumps({"osc": address, "payload": payload}, ensure_ascii=False))
             return
@@ -569,6 +582,7 @@ class OscSender:
 def build_topk_payload(
     session_id: str,
     cam_id: int,
+    cam_label: str,
     query_track_id: int,
     k: int,
     gallery_count: int,
@@ -604,8 +618,12 @@ def build_topk_payload(
                 "rank": int(result["rank"]),
                 "clip_id": str(result["clip_id"]),
                 "clip_path": str(result["clip_path"]),
+                "best_frame_path": str(result.get("best_frame_path", "")),
                 "score": round(float(result["score"]), 6),
                 "cam_id": str(result["cam_id"]),
+                "cam_label": str(result.get("cam_label", "")),
+                "event_id": str(result.get("event_id", "")),
+                "track_id": int(result.get("track_id", 0)),
                 "fallback": bool(result.get("fallback", False)),
                 "quality": round(float(result.get("quality", 0.0)), 4),
             }
@@ -616,6 +634,7 @@ def build_topk_payload(
         "timestamp": timestamp,
         "query_id": query_id,
         "cam_id": f"cam_{cam_id}",
+        "cam_label": sanitize_id(cam_label),
         "k": int(k),
         "result_count": int(len(results)),
         "gallery_count": int(gallery_count),
@@ -628,6 +647,7 @@ class LiveTopKCameraWorker(threading.Thread):
     def __init__(
         self,
         cam_id: int,
+        cam_label: str,
         cam_type: str,
         video_source: str,
         args: argparse.Namespace,
@@ -639,6 +659,7 @@ class LiveTopKCameraWorker(threading.Thread):
     ):
         super().__init__(daemon=True)
         self.cam_id = int(cam_id)
+        self.cam_label = sanitize_id(cam_label)
         self.cam_type = normalize_cam_type(cam_type)
         self.video_source = video_source
         self.source_info = parse_video_source(video_source)
@@ -670,7 +691,7 @@ class LiveTopKCameraWorker(threading.Thread):
     def run(self) -> None:
         print(
             f"[cam {self.cam_id}] Starting live Top-K worker role={self.cam_type} "
-            f"source={self.source_info['display']}"
+            f"label={self.cam_label} source={self.source_info['display']}"
         )
         started = time.monotonic()
         while not self.stop_event.is_set():
@@ -753,6 +774,7 @@ class LiveTopKCameraWorker(threading.Thread):
                     self.session_id,
                     self.snapshot_root,
                     self.cam_id,
+                    self.cam_label,
                     track_id,
                     self.output_size,
                     fps=30.0,
@@ -769,7 +791,7 @@ class LiveTopKCameraWorker(threading.Thread):
             return
 
         target = self._select_query_target(people, frame.shape[1], frame.shape[0])
-        crop = crop_person(frame, target["box"])
+        crop = visual_crop_person(frame, target["box"])
         embedding, method = self.embedder.embed_bgr(crop)
         results = self.gallery.rank(
             embedding,
@@ -782,13 +804,17 @@ class LiveTopKCameraWorker(threading.Thread):
         flat_payload, structured_payload = build_topk_payload(
             self.session_id,
             self.cam_id,
+            self.cam_label,
             query_track_id,
             max(1, int(self.args.topk)),
             self.gallery.count(),
             results,
         )
         structured_payload["embedding_method"] = method
-        structured_payload["query_quality"] = round(crop_quality(crop, target), 4)
+        structured_payload["query_quality"] = round(visual_crop_quality(crop, target, frame.shape), 4)
+        export_dir = self._export_topk_results(crop, structured_payload)
+        if export_dir:
+            structured_payload["export_dir"] = export_dir
         self.gallery.log_query(structured_payload)
         self._send_topk_payload(flat_payload, structured_payload)
         self.last_query_sent_at = now
@@ -811,16 +837,19 @@ class LiveTopKCameraWorker(threading.Thread):
         self.osc.send(f"{base}/results", flat_payload)
         self.osc.send(f"{base}/last/event_id", structured_payload["event_id"])
         self.osc.send(f"{base}/last/query_id", structured_payload["query_id"])
+        self.osc.send(f"{base}/last/cam_label", structured_payload["cam_label"])
         self.osc.send(f"{base}/last/result_count", int(structured_payload["result_count"]))
         self.osc.send(f"{base}/last/gallery_count", int(structured_payload["gallery_count"]))
         for rank in range(1, max(1, int(self.args.topk)) + 1):
             result = next((item for item in structured_payload["results"] if item["rank"] == rank), None)
             path = "" if result is None else str(result["clip_path"])
             score = 0.0 if result is None else float(result["score"])
+            cam_label = "" if result is None else str(result.get("cam_label", ""))
             self.osc.send(f"{base}/result/{rank}/path", path)
             self.osc.send(f"{base}/result/{rank}/score", score)
+            self.osc.send(f"{base}/result/{rank}/cam_label", cam_label)
         print(
-            f"[cam {self.cam_id}] TopK query={structured_payload['query_id']} "
+            f"[cam {self.cam_id} {self.cam_label}] TopK query={structured_payload['query_id']} "
             f"results={structured_payload['result_count']}/{self.args.topk} "
             f"gallery={structured_payload['gallery_count']}"
         )
@@ -829,8 +858,53 @@ class LiveTopKCameraWorker(threading.Thread):
         base = f"/walnut/live_topk/cam/{self.cam_id}/status"
         self.osc.send(f"{base}/people_count", int(len(people)))
         self.osc.send(f"{base}/role", self.cam_type)
+        self.osc.send(f"{base}/cam_label", self.cam_label)
         self.osc.send(f"{base}/gallery_count", int(self.gallery.count()))
         self.osc.send(f"{base}/active_recordings", int(len(self.recorders)))
+
+    def _export_topk_results(self, query_crop: np.ndarray | None, payload: dict[str, object]) -> str:
+        if not str(self.args.export_topk_dir or "").strip():
+            return ""
+
+        export_root = resolve_project_path(self.args.export_topk_dir)
+        query_dir = export_root / sanitize_id(self.session_id) / sanitize_id(payload["query_id"])
+        query_dir.mkdir(parents=True, exist_ok=True)
+
+        export_payload = dict(payload)
+        export_payload["export_mode"] = str(self.args.export_mode)
+        export_payload["export_dir"] = str(query_dir.resolve()).replace("\\", "/")
+        if query_crop is not None and query_crop.size:
+            query_best_path = query_dir / "query_best.jpg"
+            cv2.imwrite(str(query_best_path), query_crop)
+            export_payload["query_best_path"] = str(query_best_path.resolve()).replace("\\", "/")
+
+        exported_results = []
+        for result in export_payload.get("results", []):
+            rank = int(result["rank"])
+            rank_dir = query_dir / f"rank_{rank:02d}"
+            rank_dir.mkdir(parents=True, exist_ok=True)
+            exported = dict(result)
+
+            clip_suffix = Path(str(result.get("clip_path", ""))).suffix or ".mp4"
+            best_suffix = Path(str(result.get("best_frame_path", ""))).suffix or ".jpg"
+            exported["exported_clip"] = export_asset(
+                str(result.get("clip_path", "")),
+                rank_dir / f"clip{clip_suffix}",
+                str(self.args.export_mode),
+                "clip_path.txt",
+            )
+            exported["exported_best_frame"] = export_asset(
+                str(result.get("best_frame_path", "")),
+                rank_dir / f"best{best_suffix}",
+                str(self.args.export_mode),
+                "best_path.txt",
+            )
+            write_json(rank_dir / "score.json", exported)
+            exported_results.append(exported)
+
+        export_payload["results"] = exported_results
+        write_json(query_dir / "results.json", export_payload)
+        return str(query_dir.resolve()).replace("\\", "/")
 
     def _finalize_recorder(self, track_id: int, reason: str) -> None:
         recorder = self.recorders.pop(track_id, None)
@@ -854,8 +928,9 @@ class LiveTopKCameraWorker(threading.Thread):
                 int(record.frame_count),
             ],
         )
+        self.osc.send(f"/walnut/live_gallery/cam/{self.cam_id}/last/cam_label", record.cam_label)
         print(
-            f"[gallery] Added {record.clip_id} cam={record.cam_id} "
+            f"[gallery] Added {record.clip_id} cam={record.cam_id} label={record.cam_label} "
             f"quality={record.quality:.3f} frames={record.frame_count}"
         )
 
@@ -871,25 +946,29 @@ def main() -> int:
 
     sources = split_sources(args.rtsp, args.rtsp_envs)
     cam_types = split_cam_types(args.cam_types, len(sources))
+    cam_labels = split_cam_labels(args.cam_labels, len(sources))
     session_id = time.strftime("%Y%m%d_%H%M%S")
     log_dir = PROJECT_ROOT / "logs" / "topk_live" / session_id
 
     gallery = LiveTopKGallery(log_dir)
     embedder = AppearanceEmbedder(MODEL_CACHE_ROOT)
-    osc = OscSender(args.osc_host, args.osc_port, args.osc_dry_run)
+    osc = OscSender(args.osc_host, args.osc_port, args.osc_dry_run, args.disable_osc)
     stop_event = threading.Event()
 
     print("Starting live YOLO-ReID Top-K bridge.")
     print(f"Session: {session_id}")
-    print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run}")
+    print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
+    if args.export_topk_dir:
+        print(f"Top-K export root: {resolve_project_path(args.export_topk_dir)} mode={args.export_mode}")
     print(f"Log dir: {log_dir}")
-    for index, (source, cam_type) in enumerate(zip(sources, cam_types), start=1):
-        print(f"cam{index}: role={cam_type} source={parse_video_source(source)['display']}")
+    for index, (source, cam_type, cam_label) in enumerate(zip(sources, cam_types, cam_labels), start=1):
+        print(f"cam{index}: role={cam_type} label={cam_label} source={parse_video_source(source)['display']}")
 
     workers = [
         LiveTopKCameraWorker(
             cam_id=index,
+            cam_label=cam_label,
             cam_type=cam_type,
             video_source=source,
             args=args,
@@ -899,7 +978,7 @@ def main() -> int:
             osc=osc,
             stop_event=stop_event,
         )
-        for index, (source, cam_type) in enumerate(zip(sources, cam_types), start=1)
+        for index, (source, cam_type, cam_label) in enumerate(zip(sources, cam_types, cam_labels), start=1)
     ]
 
     for worker in workers:

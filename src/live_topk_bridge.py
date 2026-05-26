@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=9)
     parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument(
+        "--skip-webcam-preflight",
+        action="store_true",
+        help="Skip the main-thread webcam open/release used to trigger macOS camera authorization.",
+    )
     parser.add_argument("--export-topk-dir", default="", help="Optional directory for query-by-query Top-K exports.")
     parser.add_argument(
         "--export-mode",
@@ -233,6 +238,24 @@ def create_capture(video_source: str, frame_width: int, frame_height: int) -> cv
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     return cap
+
+
+def preflight_webcams(sources: list[str], frame_width: int, frame_height: int) -> None:
+    for source in sources:
+        source_info = parse_video_source(source)
+        if source_info["kind"] != "webcam":
+            continue
+        print(f"[preflight] Opening {source_info['display']} on main thread for camera authorization.")
+        cap = create_capture(source, frame_width, frame_height)
+        if not cap.isOpened():
+            print(
+                f"[preflight] Could not open {source_info['display']}. "
+                "If macOS asks for camera access, allow it and rerun."
+            )
+        else:
+            ok, _frame = cap.read()
+            print(f"[preflight] {source_info['display']} opened; first_read={bool(ok)}")
+        cap.release()
 
 
 def create_clip_writer(clip_path: Path, fps: float, frame_size: tuple[int, int]):
@@ -947,6 +970,8 @@ def main() -> int:
     sources = split_sources(args.rtsp, args.rtsp_envs)
     cam_types = split_cam_types(args.cam_types, len(sources))
     cam_labels = split_cam_labels(args.cam_labels, len(sources))
+    if not args.skip_webcam_preflight:
+        preflight_webcams(sources, args.frame_width, args.frame_height)
     session_id = time.strftime("%Y%m%d_%H%M%S")
     log_dir = PROJECT_ROOT / "logs" / "topk_live" / session_id
 

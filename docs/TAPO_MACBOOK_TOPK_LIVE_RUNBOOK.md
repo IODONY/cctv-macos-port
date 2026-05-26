@@ -48,6 +48,10 @@ export TAPO_CAM_9_RTSP_URL='rtsp://<user>:<password>@192.168.1.9'
 
 If a base RTSP URL does not open for a specific Tapo model, try the same environment variable with `/stream1` or `/stream2` appended.
 
+If every Tapo URL returns `401 Unauthorized`, the network path is reachable but RTSP authentication failed. Check the per-camera RTSP account, password, and whether RTSP/third-party streaming is enabled in the Tapo camera settings. A path change from the base URL to `/stream1` or `/stream2` will not fix an invalid account or disabled RTSP service.
+
+On macOS, the MacBook query camera must be allowed for the Python/Codex runtime in System Settings > Privacy & Security > Camera. The bridge opens webcam sources once on the main thread before starting workers so macOS can present the permission prompt. If `webcam_opened=False` or `not authorized to capture video` appears, grant camera access and rerun the same command.
+
 ## Smoke Tests
 
 First test one camera for one minute:

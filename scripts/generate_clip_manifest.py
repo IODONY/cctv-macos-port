@@ -393,9 +393,9 @@ def write_structure_report(
         fh.write(
             "| dataset_id | identity_id | clips | available_positive_count | "
             f"max_possible_own_count_at_{k} | normalized_own_recall_at_{k} | "
-            f"enough_same_identity_for_top_{k} | layout_type |\n"
+            f"additional_clips_needed_for_top_{k}_own | enough_same_identity_for_top_{k} | layout_type |\n"
         )
-        fh.write("| --- | --- | ---: | ---: | ---: | ---: | --- | --- |\n")
+        fh.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
         layout_by_identity = {
             identity_key(record): record.layout_type
             for record in records
@@ -404,10 +404,12 @@ def write_structure_report(
             available_positive = max(0, count - 1)
             max_possible = min(k, available_positive)
             normalized = 1.0 if max_possible > 0 else 0.0
+            additional_needed = max(0, k - available_positive)
             enough = available_positive >= k
             fh.write(
                 f"| {key[0]} | {key[1]} | {count} | {available_positive} | "
-                f"{max_possible} | {normalized:.4f} | {enough} | {layout_by_identity.get(key, '')} |\n"
+                f"{max_possible} | {normalized:.4f} | {additional_needed} | {enough} | "
+                f"{layout_by_identity.get(key, '')} |\n"
             )
 
         fh.write("\n## Interpretation\n\n")
@@ -419,6 +421,9 @@ def write_structure_report(
         )
         fh.write(
             "- A low own-count is not automatically an algorithm failure when the same-identity gallery is too small.\n"
+        )
+        fh.write(
+            f"- `additional_clips_needed_for_top_{k}_own` counts extra same-identity gallery clips needed per query.\n"
         )
 
 

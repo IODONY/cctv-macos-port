@@ -38,3 +38,15 @@ python wb_auto_calibrate.py --profile wb_profiles.json --camera c210_1f --angle 
 `--apply` is the only mode that contacts the camera through the local API.
 Before applying changes, the current `image.common` response is backed up under
 `/Users/fullcodex/CCTV_Project/logs/tapo_wb_backups/`.
+
+For interactive preview, press `s` in the ROI picker with `--apply-on-save`.
+This saves the ROI, applies the proposed WB gain once, waits briefly, and
+refreshes the preview frame in the same window:
+
+```bash
+TAPO_C210_1F_RTSP_URL='rtsp://CAMERA_RTSP_USER:CAMERA_RTSP_PASSWORD@CAMERA_IP:554/stream1' \
+python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entrance --apply-on-save
+```
+
+Add `--force` only when you intentionally want to apply even if the ROI safety
+checks report clipping, darkness, or uneven patches.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,10 +19,12 @@ import cv2
 
 from wb_core import (
     DEFAULT_ALGORITHM,
+    compute_next_gains,
     create_mock_frame,
     ensure_camera_angle,
     load_profiles_or_empty,
     make_roi,
+    merged_algorithm,
     read_frame_from_image,
     read_frame_from_rtsp,
     resolve_roi,
@@ -29,7 +32,7 @@ from wb_core import (
     sample_roi_from_frame,
     save_profiles,
 )
-from tapo_wb_client import load_dotenv_if_available
+from tapo_wb_client import client_from_camera_profile, load_dotenv_if_available
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--y", type=int, help="Headless ROI center y")
     parser.add_argument("--size", type=int, default=21, help="ROI size in pixels; odd values are preferred")
     parser.add_argument("--headless-save", action="store_true", help="Save ROI from --x/--y/--size without opening UI")
+    parser.add_argument("--apply-on-save", action="store_true", help="When s is pressed, save the ROI, apply proposed WB gains, and refresh the preview frame")
+    parser.add_argument("--force", action="store_true", help="With --apply-on-save, apply even if ROI safety checks fail")
+    parser.add_argument("--settle", type=float, default=1.5, help="Seconds to wait after applying gains before refreshing preview")
+    parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
+    parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
     return parser
 
 
@@ -65,7 +73,14 @@ def save_roi_to_profile(profile_path: Path, profiles: Dict[str, Any], camera_id:
     return angle["roi"]
 
 
-def overlay(frame, roi: Dict[str, Any], stats: Optional[Dict[str, Any]], dirty: bool) -> Any:
+def overlay(
+    frame,
+    roi: Dict[str, Any],
+    stats: Optional[Dict[str, Any]],
+    dirty: bool,
+    apply_on_save: bool = False,
+    message: str = "",
+) -> Any:
     vis = frame.copy()
     height, width = vis.shape[:2]
     resolved = resolve_roi(roi, width, height)
@@ -76,9 +91,13 @@ def overlay(frame, roi: Dict[str, Any], stats: Optional[Dict[str, Any]], dirty: 
 
     lines = [
         "click: select white/neutral ROI",
-        "[/]: size  |  s: save  |  c: sample  |  q: quit",
+        "[/]: size  |  s: save/apply/preview  |  c: sample  |  r: refresh  |  q: quit"
+        if apply_on_save
+        else "[/]: size  |  s: save  |  c: sample  |  r: refresh  |  q: quit",
         f"ROI x={x} y={y} size={size}" + ("  *unsaved" if dirty else ""),
     ]
+    if message:
+        lines.append(message)
     if stats:
         rgb = stats["median_rgb"]
         lines.extend(
@@ -96,9 +115,66 @@ def overlay(frame, roi: Dict[str, Any], stats: Optional[Dict[str, Any]], dirty: 
     return vis
 
 
+def apply_saved_roi(
+    args: argparse.Namespace,
+    profile_path: Path,
+    profiles: Dict[str, Any],
+    camera: Dict[str, Any],
+    angle: Dict[str, Any],
+    roi: Dict[str, Any],
+    frame: Any,
+    state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    algorithm = merged_algorithm(profiles, camera, angle)
+    if args.k is not None:
+        algorithm["k"] = args.k
+    if args.max_step is not None:
+        algorithm["max_step"] = args.max_step
+
+    stats = sample_roi_from_frame(frame, roi, algorithm)
+    gains = dict(angle.get("gains") or camera.get("gains") or {"R": 50, "G": 50, "B": 50})
+    proposed, details = compute_next_gains(stats["median_rgb"], gains, algorithm)
+    row = {"stats": stats, "details": details, "proposed_gains": proposed}
+    print("\n=== ROI save/apply preview ===")
+    print(json.dumps(row, ensure_ascii=False, indent=2))
+
+    if not stats["ok_to_adjust"] and not args.force:
+        state["message"] = "saved; apply blocked: " + ", ".join(stats["reasons"])
+        print("[BLOCKED] ROI safety checks failed. Not applying. Use --force to override.")
+        return stats
+
+    if state.get("client") is None:
+        state["client"] = client_from_camera_profile(camera)
+    if state.get("backup_path") is None:
+        state["backup_path"] = state["client"].backup_image_common()
+        print(f"[BACKUP] image.common saved to {state['backup_path']}")
+
+    print(f"[APPLY] gains {gains} -> {proposed}")
+    result = state["client"].apply_manual_wb_gains(proposed)
+    print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
+
+    angle["gains"] = proposed
+    angle["last_roi_picker_apply"] = row
+    save_profiles(profile_path, profiles)
+    time.sleep(max(0.0, args.settle))
+
+    refreshed = load_frame(args, camera)
+    state["frame"] = refreshed
+    state["height"], state["width"] = refreshed.shape[:2]
+    refreshed_roi = resolve_roi(roi, state["width"], state["height"])
+    state["x"] = refreshed_roi["x"]
+    state["y"] = refreshed_roi["y"]
+    state["size"] = refreshed_roi["size"]
+    state["message"] = f"applied preview: R={proposed['R']} G={proposed['G']} B={proposed['B']}"
+    return sample_roi_from_frame(refreshed, roi, algorithm)
+
+
 def main() -> int:
     load_dotenv_if_available()
     args = build_parser().parse_args()
+    if args.apply_on_save and (args.mock or args.image):
+        raise SystemExit("--apply-on-save requires a live camera frame; do not use --mock or --image")
+
     profile_path = Path(args.profile)
     profiles = load_profiles_or_empty(profile_path)
     camera, angle = ensure_camera_angle(profiles, args.camera, args.angle)
@@ -114,7 +190,19 @@ def main() -> int:
 
     existing_roi = angle.get("roi") or make_roi(width // 2, height // 2, args.size, width, height)
     resolved = resolve_roi(existing_roi, width, height)
-    state = {"x": resolved["x"], "y": resolved["y"], "size": resolved["size"], "stats": None, "dirty": False}
+    state = {
+        "x": resolved["x"],
+        "y": resolved["y"],
+        "size": resolved["size"],
+        "stats": None,
+        "dirty": False,
+        "frame": frame,
+        "width": width,
+        "height": height,
+        "message": "",
+        "client": None,
+        "backup_path": None,
+    }
     window = f"WB ROI Picker - {args.camera}/{args.angle}"
 
     def on_mouse(event, x, y, flags, param):
@@ -122,31 +210,55 @@ def main() -> int:
             state["x"] = int(x)
             state["y"] = int(y)
             state["dirty"] = True
-            roi = make_roi(state["x"], state["y"], state["size"], width, height)
-            state["stats"] = sample_roi_from_frame(frame, roi, DEFAULT_ALGORITHM)
+            state["message"] = ""
+            roi = make_roi(state["x"], state["y"], state["size"], state["width"], state["height"])
+            state["stats"] = sample_roi_from_frame(state["frame"], roi, DEFAULT_ALGORITHM)
 
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(window, on_mouse)
 
     while True:
-        roi = make_roi(state["x"], state["y"], state["size"], width, height)
-        cv2.imshow(window, overlay(frame, roi, state["stats"], state["dirty"]))
+        roi = make_roi(state["x"], state["y"], state["size"], state["width"], state["height"])
+        cv2.imshow(window, overlay(state["frame"], roi, state["stats"], state["dirty"], args.apply_on_save, state["message"]))
         key = cv2.waitKey(30) & 0xFF
         if key in (ord("q"), 27):
             break
         if key == ord("["):
             state["size"] = max(3, int(state["size"]) - 2)
             state["dirty"] = True
+            state["message"] = ""
         elif key == ord("]"):
             state["size"] = int(state["size"]) + 2
             state["dirty"] = True
+            state["message"] = ""
         elif key == ord("c"):
-            state["stats"] = sample_roi_from_frame(frame, roi, DEFAULT_ALGORITHM)
+            state["stats"] = sample_roi_from_frame(state["frame"], roi, DEFAULT_ALGORITHM)
             print(json.dumps(state["stats"], ensure_ascii=False, indent=2))
+        elif key == ord("r"):
+            state["frame"] = load_frame(args, camera)
+            state["height"], state["width"] = state["frame"].shape[:2]
+            resolved = resolve_roi(roi, state["width"], state["height"])
+            state["x"] = resolved["x"]
+            state["y"] = resolved["y"]
+            state["size"] = resolved["size"]
+            state["stats"] = None
+            state["message"] = "preview refreshed"
         elif key == ord("s"):
-            saved = save_roi_to_profile(profile_path, profiles, args.camera, args.angle, frame, state["x"], state["y"], state["size"])
+            saved = save_roi_to_profile(
+                profile_path,
+                profiles,
+                args.camera,
+                args.angle,
+                state["frame"],
+                state["x"],
+                state["y"],
+                state["size"],
+            )
             state["dirty"] = False
             print(json.dumps({"saved_roi": saved, "profile": str(profile_path)}, ensure_ascii=False, indent=2))
+            state["stats"] = sample_roi_from_frame(state["frame"], saved, DEFAULT_ALGORITHM)
+            if args.apply_on_save:
+                state["stats"] = apply_saved_roi(args, profile_path, profiles, camera, angle, saved, state["frame"], state)
 
     cv2.destroyAllWindows()
     return 0

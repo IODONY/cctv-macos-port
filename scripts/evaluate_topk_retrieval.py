@@ -188,6 +188,8 @@ def rank_candidates(candidates: list[dict[str, object]]) -> list[dict[str, objec
 def topk_metrics(query_identity: str, ranked: list[dict[str, object]], k: int, pool_k: int) -> dict[str, object]:
     top_k = ranked[:k]
     top_pool = ranked[:pool_k]
+    returned_at_k = len(top_k)
+    returned_at_pool = len(top_pool)
     positives_available = sum(1 for row in ranked if row["candidate_identity"] == query_identity)
     own_at_k = sum(1 for row in top_k if row["candidate_identity"] == query_identity)
     own_at_pool = sum(1 for row in top_pool if row["candidate_identity"] == query_identity)
@@ -218,20 +220,26 @@ def topk_metrics(query_identity: str, ranked: list[dict[str, object]], k: int, p
 
     return {
         "positives_available": positives_available,
+        f"returned_at_{k}": returned_at_k,
         f"own_at_{k}": own_at_k,
         f"wrong_at_{k}": wrong_at_k,
         f"recall_at_{k}": round(own_at_k / positives_available, 4) if positives_available else 0.0,
-        f"precision_at_{k}": round(own_at_k / k, 4) if k else 0.0,
+        f"precision_at_{k}": round(own_at_k / returned_at_k, 4) if returned_at_k else 0.0,
+        f"returned_at_{pool_k}": returned_at_pool,
         f"own_at_{pool_k}": own_at_pool,
         f"wrong_at_{pool_k}": wrong_at_pool,
         f"recall_at_{pool_k}": round(own_at_pool / positives_available, 4) if positives_available else 0.0,
-        f"precision_at_{pool_k}": round(own_at_pool / pool_k, 4) if pool_k else 0.0,
-        f"ambiguous_rate_at_{k}": round(ambiguous_at_k / k, 4) if k else 0.0,
-        f"false_match_rate_at_{k}": round(false_match_at_k / k, 4) if k else 0.0,
-        f"hard_negative_rate_at_{k}": round(hard_negative_at_k / k, 4) if k else 0.0,
+        f"precision_at_{pool_k}": round(own_at_pool / returned_at_pool, 4) if returned_at_pool else 0.0,
+        f"ambiguous_rate_at_{k}": round(ambiguous_at_k / returned_at_k, 4) if returned_at_k else 0.0,
+        f"false_match_rate_at_{k}": round(false_match_at_k / returned_at_k, 4) if returned_at_k else 0.0,
+        f"hard_negative_rate_at_{k}": round(hard_negative_at_k / returned_at_k, 4) if returned_at_k else 0.0,
         "rank_k_margin": round(kth_score - next_score, 4) if next_score is not None else None,
         "rank_k_margin_to_first_wrong_high_risk": wrong_margin,
     }
+
+
+def micro_rate(numerator: int, denominator: int) -> float:
+    return round(numerator / denominator, 4) if denominator else 0.0
 
 
 def summarize_queries(query_results: list[dict[str, object]], k: int, pool_k: int) -> dict[str, object]:
@@ -258,13 +266,63 @@ def summarize_queries(query_results: list[dict[str, object]], k: int, pool_k: in
 
     own_values = [int(row["metrics"][f"own_at_{k}"]) for row in query_results]
     majority_target = (k // 2) + 1
+    total_positives = sum(int(row["metrics"]["positives_available"]) for row in query_results)
+    total_returned_at_k = sum(int(row["metrics"][f"returned_at_{k}"]) for row in query_results)
+    total_own_at_k = sum(int(row["metrics"][f"own_at_{k}"]) for row in query_results)
+    total_wrong_at_k = sum(int(row["metrics"][f"wrong_at_{k}"]) for row in query_results)
+    total_returned_at_pool = sum(int(row["metrics"][f"returned_at_{pool_k}"]) for row in query_results)
+    total_own_at_pool = sum(int(row["metrics"][f"own_at_{pool_k}"]) for row in query_results)
+    total_wrong_at_pool = sum(int(row["metrics"][f"wrong_at_{pool_k}"]) for row in query_results)
     return {
         **means,
+        "total_positives_available": total_positives,
+        f"total_returned_at_{k}": total_returned_at_k,
+        f"total_own_at_{k}": total_own_at_k,
+        f"total_wrong_at_{k}": total_wrong_at_k,
+        f"micro_recall_at_{k}": micro_rate(total_own_at_k, total_positives),
+        f"micro_precision_at_{k}": micro_rate(total_own_at_k, total_returned_at_k),
+        f"total_returned_at_{pool_k}": total_returned_at_pool,
+        f"total_own_at_{pool_k}": total_own_at_pool,
+        f"total_wrong_at_{pool_k}": total_wrong_at_pool,
+        f"micro_recall_at_{pool_k}": micro_rate(total_own_at_pool, total_positives),
+        f"micro_precision_at_{pool_k}": micro_rate(total_own_at_pool, total_returned_at_pool),
         f"min_own_at_{k}": min(own_values),
         f"max_own_at_{k}": max(own_values),
         f"queries_with_majority_own_at_{k}": sum(1 for value in own_values if value >= majority_target),
         "query_count": len(query_results),
     }
+
+
+def summarize_identities(query_results: list[dict[str, object]], k: int) -> list[dict[str, object]]:
+    by_identity: dict[str, list[dict[str, object]]] = {}
+    for row in query_results:
+        by_identity.setdefault(str(row["identity_id"]), []).append(row)
+
+    summaries = []
+    majority_target = (k // 2) + 1
+    for identity_id, rows in sorted(by_identity.items()):
+        total_positives = sum(int(row["metrics"]["positives_available"]) for row in rows)
+        total_returned = sum(int(row["metrics"][f"returned_at_{k}"]) for row in rows)
+        total_own = sum(int(row["metrics"][f"own_at_{k}"]) for row in rows)
+        total_wrong = sum(int(row["metrics"][f"wrong_at_{k}"]) for row in rows)
+        recalls = [float(row["metrics"][f"recall_at_{k}"]) for row in rows]
+        own_values = [int(row["metrics"][f"own_at_{k}"]) for row in rows]
+        summaries.append(
+            {
+                "identity_id": identity_id,
+                "query_count": len(rows),
+                "total_positives_available": total_positives,
+                f"total_own_at_{k}": total_own,
+                f"total_wrong_at_{k}": total_wrong,
+                f"micro_recall_at_{k}": micro_rate(total_own, total_positives),
+                f"micro_precision_at_{k}": micro_rate(total_own, total_returned),
+                f"mean_recall_at_{k}": round(sum(recalls) / len(recalls), 4) if recalls else 0.0,
+                f"min_own_at_{k}": min(own_values) if own_values else 0,
+                f"max_own_at_{k}": max(own_values) if own_values else 0,
+                f"queries_with_majority_own_at_{k}": sum(1 for value in own_values if value >= majority_target),
+            }
+        )
+    return summaries
 
 
 def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
@@ -328,6 +386,7 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
         "same_camera_weights": same_camera_weights,
         "cross_camera_weights": cross_camera_weights,
         "summary": summarize_queries(query_results, args.k, args.candidate_pool),
+        "identity_summary": summarize_identities(query_results, args.k),
         "queries": query_results,
     }
 
@@ -337,12 +396,17 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
     k = int(report["k"])
     pool_k = int(report["candidate_pool"])
     summary = report["summary"]
+    identity_summary = report["identity_summary"]
     queries = report["queries"]
     assert isinstance(summary, dict)
+    assert isinstance(identity_summary, list)
     assert isinstance(queries, list)
 
     with path.open("w", encoding="utf-8") as fh:
-        fh.write("# Top-K Retrieval Evaluation Report\n\n")
+        fh.write("# YOLO-ReID Top-K Retrieval Evaluation Report\n\n")
+        fh.write(
+            "This evaluates labeled clips by ranking every other clip as a gallery candidate for each query.\n\n"
+        )
         fh.write(f"- Clips manifest: `{report['clips_path']}`\n")
         fh.write(f"- Query count: `{report['query_count']}`\n")
         fh.write(f"- Gallery count: `{report['gallery_count']}`\n")
@@ -351,9 +415,34 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
         fh.write(f"- Match threshold: `{report['match_threshold']}`\n")
         fh.write(f"- Ambiguous threshold: `{report['ambiguous_threshold']}`\n\n")
 
+        fh.write("## Headline\n\n")
+        fh.write(f"- `Recall@{k}` macro/query mean: `{summary[f'mean_recall_at_{k}']}`\n")
+        fh.write(
+            f"- `Recall@{k}` micro/positive-weighted: `{summary[f'micro_recall_at_{k}']}` "
+            f"({summary[f'total_own_at_{k}']}/{summary['total_positives_available']})\n"
+        )
+        fh.write(f"- `Precision@{k}` macro/query mean: `{summary[f'mean_precision_at_{k}']}`\n")
+        fh.write(f"- `Top-{k} own clips per query`: `{summary[f'mean_own_at_{k}']}` mean\n")
+        fh.write(f"- `Queries with majority own@{k}`: `{summary[f'queries_with_majority_own_at_{k}']}`\n\n")
+
         fh.write("## Summary Metrics\n\n")
         for key in sorted(summary):
             fh.write(f"- `{key}`: `{summary[key]}`\n")
+
+        fh.write("\n## Per Identity\n\n")
+        fh.write(
+            f"| identity | queries | own@{k} total | wrong@{k} total | recall@{k} micro | "
+            f"recall@{k} mean | precision@{k} micro | own@{k} min-max | majority-own queries |\n"
+        )
+        fh.write("| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |\n")
+        for row in identity_summary:
+            fh.write(
+                f"| {row['identity_id']} | {row['query_count']} | {row[f'total_own_at_{k}']} | "
+                f"{row[f'total_wrong_at_{k}']} | {row[f'micro_recall_at_{k}']} | "
+                f"{row[f'mean_recall_at_{k}']} | {row[f'micro_precision_at_{k}']} | "
+                f"{row[f'min_own_at_{k}']}-{row[f'max_own_at_{k}']} | "
+                f"{row[f'queries_with_majority_own_at_{k}']} |\n"
+            )
 
         fh.write("\n## Per Query Top-K\n\n")
         fh.write(

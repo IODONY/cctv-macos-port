@@ -1,4 +1,6 @@
-# Top-K Retrieval Evaluation Report
+# YOLO-ReID Top-K Retrieval Evaluation Report
+
+This evaluates labeled clips by ranking every other clip as a gallery candidate for each query.
 
 - Clips manifest: `data/labels/clips.csv`
 - Query count: `18`
@@ -7,6 +9,14 @@
 - Candidate pool: `12`
 - Match threshold: `0.72`
 - Ambiguous threshold: `0.25`
+
+## Headline
+
+- `Recall@9` macro/query mean: `0.8056`
+- `Recall@9` micro/positive-weighted: `0.8333` (80/96)
+- `Precision@9` macro/query mean: `0.4938`
+- `Top-9 own clips per query`: `4.4444` mean
+- `Queries with majority own@9`: `10`
 
 ## Summary Metrics
 
@@ -22,9 +32,28 @@
 - `mean_recall_at_9`: `0.8056`
 - `mean_wrong_at_12`: `7.1111`
 - `mean_wrong_at_9`: `4.5556`
+- `micro_precision_at_12`: `0.4074`
+- `micro_precision_at_9`: `0.4938`
+- `micro_recall_at_12`: `0.9167`
+- `micro_recall_at_9`: `0.8333`
 - `min_own_at_9`: `0`
 - `queries_with_majority_own_at_9`: `10`
 - `query_count`: `18`
+- `total_own_at_12`: `88`
+- `total_own_at_9`: `80`
+- `total_positives_available`: `96`
+- `total_returned_at_12`: `216`
+- `total_returned_at_9`: `162`
+- `total_wrong_at_12`: `128`
+- `total_wrong_at_9`: `82`
+
+## Per Identity
+
+| identity | queries | own@9 total | wrong@9 total | recall@9 micro | recall@9 mean | precision@9 micro | own@9 min-max | majority-own queries |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| person_001 | 4 | 7 | 29 | 0.5833 | 0.5834 | 0.1944 | 0-3 | 0 |
+| person_002 | 7 | 42 | 21 | 1.0 | 1.0 | 0.6667 | 6-6 | 7 |
+| person_003 | 7 | 31 | 32 | 0.7381 | 0.7381 | 0.4921 | 4-5 | 3 |
 
 ## Per Query Top-K
 

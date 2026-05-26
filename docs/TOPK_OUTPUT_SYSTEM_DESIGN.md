@@ -9,10 +9,12 @@ In live exhibition mode, `identity_id` is not available. Identity labels are onl
 ## Runtime Flow
 
 1. First and second floor cameras record gallery clips.
-2. YOLO-based person detection triggers recording on and off.
-3. Each completed clip or tracklet is analyzed for best shots.
-4. The selected best shot, crop, or tracklet representation is converted into an appearance ReID embedding or equivalent retrieval profile.
-5. The gallery stores one or more retrieval records per clip or tracklet:
+2. YOLO-based person detection triggers recording on and off per local person track.
+3. If several people appear in one camera view, each tracked person creates an independent cropped clip and an independent ReID best frame.
+4. A clip closes when that person track leaves the frame for a short grace window.
+5. Each completed clip or tracklet is analyzed for best shots.
+6. The selected best shot, crop, or tracklet representation is converted into an appearance ReID embedding or equivalent retrieval profile.
+7. The gallery stores one or more retrieval records per clip or tracklet:
    - `clip_id`
    - `clip_path`
    - `dataset_id` or session id
@@ -20,10 +22,10 @@ In live exhibition mode, `identity_id` is not available. Identity labels are onl
    - `event_id`
    - embedding/profile vector
    - quality metadata
-6. A third-floor query event creates a query clip, best shot, and query embedding/profile.
-7. The ranker compares the query against gallery records and returns Top-K results.
-8. If the high-confidence result count is too small, fallback fills missing slots with lower-confidence but non-blocked candidates.
-9. TouchDesigner receives a payload with ranked clip paths and scores.
+8. A third-floor query event creates a query crop and query embedding/profile from the current target person.
+9. The ranker compares the query against gallery records and returns Top-K results.
+10. If the high-confidence result count is too small, fallback fills missing slots with lower-confidence but non-blocked candidates.
+11. TouchDesigner receives a payload with ranked clip paths and scores.
 
 ## Ranking Behavior
 

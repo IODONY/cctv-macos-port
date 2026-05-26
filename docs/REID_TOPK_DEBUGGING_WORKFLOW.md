@@ -76,6 +76,18 @@ Use these metrics together:
 - `Normalized OwnRecall@9`: own clips found out of the maximum possible own clips at K.
 - `output_readiness`: whether the result is ready, data-limited, or ranking-limited.
 
+## Live Track Debugging
+
+For the Tapo + MacBook runtime, debug one local person track at a time:
+
+1. Start the live bridge with `--osc-dry-run --max-runtime-seconds 30`.
+2. Confirm each detected person creates a separate cropped clip under `snapshots/live_topk/`.
+3. Confirm each clip has a matching `_best.jpg` ReID frame.
+4. Inspect `logs/topk_live/<session>/gallery_events.jsonl` for clip quality and embedding method.
+5. Stand in front of the MacBook query camera and inspect `query_results.jsonl`.
+6. Check whether rank 1 through rank 9 are visually plausible before opening TouchDesigner.
+7. If ranking is weak, inspect the query crop and gallery best frames before changing thresholds.
+
 ## Stability Rules
 
 - Do not use face recognition or demographic inference.

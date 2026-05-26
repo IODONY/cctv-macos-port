@@ -828,7 +828,7 @@ def main() -> int:
     print(f"Wrote {project_relative(json_path)}")
     print(f"Wrote {project_relative(eval_path)}")
     print(f"Wrote {project_relative(debug_path)}")
-    if args.dataset == "test_clip_0527":
+    if args.dataset == "test_clip_0527" and not args.query_cams:
         dataset_path = resolve_inside_project(args.dataset_output_md)
         write_eval_report(dataset_path, report)
         print(f"Wrote {project_relative(dataset_path)}")

@@ -19,6 +19,11 @@ from evaluate_labeled_clips import (
     resolve_inside_project,
 )
 from walnut_core import WalnutAnalyzer
+from visual_reid import (
+    TorchvisionEmbedder,
+    analyze_clip_visual,
+    serializable_visual_analysis,
+)
 
 
 OUTCOME_RANK = {
@@ -271,6 +276,136 @@ def score_candidate(
     }
 
 
+def embedding_similarity(left: dict[str, object], right: dict[str, object]) -> float:
+    left_embedding = left.get("embedding")
+    right_embedding = right.get("embedding")
+    if left_embedding is None or right_embedding is None:
+        return 0.0
+    return clamp(float(left_embedding @ right_embedding))
+
+
+def visual_outcome(score: float, match_threshold: float, ambiguous_threshold: float) -> str:
+    if score >= match_threshold:
+        return "matched"
+    if score >= ambiguous_threshold:
+        return "ambiguous"
+    return "no_match"
+
+
+def score_visual_candidate(
+    args: argparse.Namespace,
+    query_clip: RetrievalClip,
+    candidate_clip: RetrievalClip,
+    query_analysis: dict[str, object],
+    candidate_analysis: dict[str, object],
+) -> dict[str, object]:
+    score = embedding_similarity(query_analysis, candidate_analysis)
+    outcome = visual_outcome(score, args.visual_match_threshold, args.visual_ambiguous_threshold)
+    is_same_identity = same_identity(query_clip, candidate_clip)
+    hard_negative = not is_same_identity and query_clip.cam_id == candidate_clip.cam_id
+    missing_reasons = []
+    if query_analysis.get("embedding") is None:
+        missing_reasons.append("query_embedding_missing")
+    if candidate_analysis.get("embedding") is None:
+        missing_reasons.append("candidate_embedding_missing")
+
+    query_quality = float(query_analysis.get("best_crop_quality") or 0.0)
+    candidate_quality = float(candidate_analysis.get("best_crop_quality") or 0.0)
+    crop_confidence = min(query_quality, candidate_quality)
+    if crop_confidence <= 0.0:
+        outcome = "low_confidence"
+
+    return {
+        "query_id": query_clip.clip_id,
+        "candidate_id": candidate_clip.clip_id,
+        "query_dataset": query_clip.dataset_id,
+        "candidate_dataset": candidate_clip.dataset_id,
+        "query_identity": query_clip.identity_id,
+        "candidate_identity": candidate_clip.identity_id,
+        "query_cam": query_clip.cam_id,
+        "candidate_cam": candidate_clip.cam_id,
+        "candidate_clip_path": project_relative(candidate_clip.clip_path),
+        "same_identity": is_same_identity,
+        "pair_mode": "same_camera" if query_clip.cam_id == candidate_clip.cam_id else "cross_camera",
+        "retrieval_score": round(score, 4),
+        "matching_score": round(score, 4),
+        "profile_confidence": round(crop_confidence, 4),
+        "available_weight": 1.0 if score > 0.0 else 0.0,
+        "outcome": outcome,
+        "weighted_components": {
+            "visual_embedding": round(score, 4),
+            "query_crop_quality": round(query_quality, 4),
+            "candidate_crop_quality": round(candidate_quality, 4),
+        },
+        "strong_no_match_reasons": missing_reasons,
+        "missing_comparison_keys": missing_reasons,
+        "hard_negative": hard_negative,
+        "visual_score": round(score, 4),
+        "profile_retrieval_score": None,
+        "query_crop_quality": round(query_quality, 4),
+        "candidate_crop_quality": round(candidate_quality, 4),
+    }
+
+
+def score_hybrid_candidate(
+    args: argparse.Namespace,
+    query_clip: RetrievalClip,
+    candidate_clip: RetrievalClip,
+    query_profile_analysis: dict[str, object],
+    candidate_profile_analysis: dict[str, object],
+    query_visual_analysis: dict[str, object],
+    candidate_visual_analysis: dict[str, object],
+    same_camera_weights: dict[str, float],
+    cross_camera_weights: dict[str, float],
+) -> dict[str, object]:
+    profile_row = score_candidate(
+        args,
+        query_clip,
+        candidate_clip,
+        query_profile_analysis,
+        candidate_profile_analysis,
+        same_camera_weights,
+        cross_camera_weights,
+    )
+    visual_row = score_visual_candidate(
+        args,
+        query_clip,
+        candidate_clip,
+        query_visual_analysis,
+        candidate_visual_analysis,
+    )
+    visual_weight = max(0.0, min(1.0, float(args.hybrid_visual_weight)))
+    profile_score = float(profile_row["retrieval_score"])
+    visual_score = float(visual_row["visual_score"])
+    score = round(clamp((visual_score * visual_weight) + (profile_score * (1.0 - visual_weight))), 4)
+    profile_row["retrieval_score"] = score
+    profile_row["matching_score"] = score
+    profile_row["profile_retrieval_score"] = round(profile_score, 4)
+    profile_row["visual_score"] = round(visual_score, 4)
+    profile_row["query_crop_quality"] = visual_row["query_crop_quality"]
+    profile_row["candidate_crop_quality"] = visual_row["candidate_crop_quality"]
+    profile_row["weighted_components"] = {
+        **profile_row.get("weighted_components", {}),
+        "visual_embedding": round(visual_score, 4),
+        "profile_retrieval_score": round(profile_score, 4),
+        "hybrid_visual_weight": round(visual_weight, 4),
+    }
+    profile_row["outcome"] = visual_outcome(score, args.visual_match_threshold, args.visual_ambiguous_threshold)
+    profile_row["strong_no_match_reasons"] = list(
+        dict.fromkeys(
+            list(profile_row.get("strong_no_match_reasons", []))
+            + list(visual_row.get("strong_no_match_reasons", []))
+        )
+    )
+    profile_row["missing_comparison_keys"] = list(
+        dict.fromkeys(
+            list(profile_row.get("missing_comparison_keys", []))
+            + list(visual_row.get("missing_comparison_keys", []))
+        )
+    )
+    return profile_row
+
+
 def rank_candidates(candidates: list[dict[str, object]]) -> list[dict[str, object]]:
     ranked = sorted(
         candidates,
@@ -287,6 +422,60 @@ def rank_candidates(candidates: list[dict[str, object]]) -> list[dict[str, objec
     for index, candidate in enumerate(ranked, start=1):
         candidate["rank"] = index
     return ranked
+
+
+def apply_visual_rescue(
+    ranked: list[dict[str, object]],
+    k: int,
+    rescue_count: int,
+    rescue_margin: float,
+    rescue_threshold: float,
+) -> list[dict[str, object]]:
+    if rescue_count <= 0 or len(ranked) <= k:
+        return ranked
+    if "visual_score" not in ranked[0] or ranked[0].get("visual_score") is None:
+        return ranked
+
+    kth_score = float(ranked[k - 1]["retrieval_score"])
+    next_score = float(ranked[k]["retrieval_score"])
+    if kth_score - next_score > rescue_margin:
+        return ranked
+
+    top_k = [candidate.copy() for candidate in ranked[:k]]
+    rest = [candidate.copy() for candidate in ranked[k:]]
+    selected = []
+    selected_ids = set()
+    for candidate in sorted(rest, key=lambda row: float(row.get("visual_score") or 0.0), reverse=True):
+        if float(candidate.get("visual_score") or 0.0) < rescue_threshold:
+            continue
+        candidate["visual_rescued"] = True
+        selected.append(candidate)
+        selected_ids.add(candidate["candidate_id"])
+        if len(selected) >= rescue_count:
+            break
+
+    if not selected:
+        return ranked
+
+    remaining_rest = [candidate for candidate in rest if candidate["candidate_id"] not in selected_ids]
+    replace_count = min(len(selected), len(top_k))
+    top_by_weakness = sorted(
+        top_k,
+        key=lambda row: (
+            float(row.get("retrieval_score") or 0.0),
+            float(row.get("visual_score") or 0.0),
+        ),
+    )
+    removed_ids = {candidate["candidate_id"] for candidate in top_by_weakness[:replace_count]}
+    removed = [candidate for candidate in top_k if candidate["candidate_id"] in removed_ids]
+    kept_top = [candidate for candidate in top_k if candidate["candidate_id"] not in removed_ids]
+    rescued_top = rank_candidates(kept_top + selected)
+    tail = rank_candidates(removed + remaining_rest)
+    rescued_ids = {candidate["candidate_id"] for candidate in rescued_top}
+    output = rescued_top + [candidate for candidate in tail if candidate["candidate_id"] not in rescued_ids]
+    for index, candidate in enumerate(output, start=1):
+        candidate["rank"] = index
+    return output
 
 
 def output_readiness(k: int, own_at_k: int, wrong_at_k: int, insufficient_gallery: bool, insufficient_same: bool) -> str:
@@ -498,10 +687,34 @@ def summarize_camera_pairs(query_results: list[dict[str, object]], k: int) -> li
     return summaries
 
 
+def summarize_visual_analyses(analysis_cache: dict[str, dict[str, object]]) -> dict[str, object]:
+    if not analysis_cache:
+        return {}
+    rows = list(analysis_cache.values())
+    ok_rows = [row for row in rows if row.get("ok")]
+    quality_values = [float(row.get("best_crop_quality") or 0.0) for row in ok_rows]
+    crop_counts = [int(row.get("crop_count") or 0) for row in rows]
+    failure_counts = Counter(str(row.get("reason") or "unknown") for row in rows if not row.get("ok"))
+    methods = Counter(str(row.get("embedding_method") or "unknown") for row in ok_rows)
+    return {
+        "clip_count": len(rows),
+        "crop_success_count": len(ok_rows),
+        "crop_failure_count": len(rows) - len(ok_rows),
+        "cache_hit_count": sum(1 for row in rows if row.get("cache_hit")),
+        "mean_crop_count": round(sum(crop_counts) / len(crop_counts), 4) if crop_counts else 0.0,
+        "mean_best_crop_quality": round(sum(quality_values) / len(quality_values), 4) if quality_values else 0.0,
+        "min_best_crop_quality": round(min(quality_values), 4) if quality_values else 0.0,
+        "max_best_crop_quality": round(max(quality_values), 4) if quality_values else 0.0,
+        "failure_reasons": dict(sorted(failure_counts.items())),
+        "embedding_methods": dict(sorted(methods.items())),
+    }
+
+
 def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
     clips = load_retrieval_clips(resolve_inside_project(args.clips))
     same_camera_weights, cross_camera_weights = build_weight_sets(args)
     specs = build_query_specs(clips, args)
+    backend = str(args.retrieval_backend).strip().lower()
     analyzer = WalnutAnalyzer(vote_frame_window=args.vote_frame_window)
 
     clips_to_analyze: dict[str, RetrievalClip] = {}
@@ -511,35 +724,98 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
             clips_to_analyze[candidate.clip_id] = candidate
 
     profile_cache = {}
-    for clip_id, clip in clips_to_analyze.items():
-        profile_cache[clip_id] = analyze_clip(
-            analyzer,
-            clip,
-            max_frames=args.max_frames,
-            sample_every=args.sample_every,
+    if backend in {"profile", "hybrid"}:
+        for clip_id, clip in clips_to_analyze.items():
+            profile_cache[clip_id] = analyze_clip(
+                analyzer,
+                clip,
+                max_frames=args.max_frames,
+                sample_every=args.sample_every,
+            )
+
+    visual_cache = {}
+    if backend in {"visual", "hybrid"}:
+        visual_analyzer = WalnutAnalyzer(vote_frame_window=args.visual_vote_frame_window)
+        embedder = TorchvisionEmbedder(
+            model_name=args.embedding_model,
+            color_weight=args.visual_color_weight,
         )
+        debug_dir = resolve_inside_project(args.visual_debug_dir)
+        embedding_cache_dir = resolve_inside_project(args.embedding_cache_dir)
+        for clip_id, clip in clips_to_analyze.items():
+            visual_cache[clip_id] = analyze_clip_visual(
+                visual_analyzer,
+                embedder,
+                clip.clip_path,
+                clip.clip_id,
+                max_frames=args.max_frames,
+                sample_every=args.sample_every,
+                top_n=args.visual_top_n,
+                save_debug_crops=args.save_debug_crops,
+                debug_dir=debug_dir,
+                embedding_cache_dir=embedding_cache_dir,
+                crop_expand_ratio=args.crop_expand_ratio,
+            )
 
     query_results = []
     unique_gallery_ids = set()
     for spec in specs:
         query_clip = spec.query_clip
         candidates = []
-        query_analysis = profile_cache[query_clip.clip_id]
+        query_analysis = (
+            visual_cache[query_clip.clip_id]
+            if backend == "visual"
+            else profile_cache.get(query_clip.clip_id, {})
+        )
         for candidate_clip in spec.gallery_clips:
             unique_gallery_ids.add(candidate_clip.clip_id)
-            candidate_analysis = profile_cache[candidate_clip.clip_id]
-            candidates.append(
-                score_candidate(
-                    args,
-                    query_clip,
-                    candidate_clip,
-                    query_analysis,
-                    candidate_analysis,
-                    same_camera_weights,
-                    cross_camera_weights,
+            if backend == "visual":
+                candidate_analysis = visual_cache[candidate_clip.clip_id]
+                candidates.append(
+                    score_visual_candidate(
+                        args,
+                        query_clip,
+                        candidate_clip,
+                        visual_cache[query_clip.clip_id],
+                        candidate_analysis,
+                    )
                 )
-            )
+            elif backend == "hybrid":
+                candidates.append(
+                    score_hybrid_candidate(
+                        args,
+                        query_clip,
+                        candidate_clip,
+                        profile_cache[query_clip.clip_id],
+                        profile_cache[candidate_clip.clip_id],
+                        visual_cache[query_clip.clip_id],
+                        visual_cache[candidate_clip.clip_id],
+                        same_camera_weights,
+                        cross_camera_weights,
+                    )
+                )
+            else:
+                candidate_analysis = profile_cache[candidate_clip.clip_id]
+                candidates.append(
+                    score_candidate(
+                        args,
+                        query_clip,
+                        candidate_clip,
+                        profile_cache[query_clip.clip_id],
+                        candidate_analysis,
+                        same_camera_weights,
+                        cross_camera_weights,
+                    )
+                )
         ranked = rank_candidates(candidates)
+        if backend == "hybrid":
+            ranked = apply_visual_rescue(
+                ranked,
+                args.k,
+                args.visual_rescue_count,
+                args.visual_rescue_margin,
+                args.visual_rescue_threshold,
+            )
         metrics = topk_metrics(query_clip, ranked, args.k, args.candidate_pool)
         query_results.append(
             {
@@ -550,7 +826,16 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
                 "take_id": query_clip.take_id,
                 "event_id": query_clip.event_id,
                 "clip_path": project_relative(query_clip.clip_path),
-                "analysis": query_analysis,
+                "analysis": (
+                    serializable_visual_analysis(query_analysis)
+                    if backend == "visual"
+                    else query_analysis
+                ),
+                "visual_analysis": (
+                    serializable_visual_analysis(visual_cache[query_clip.clip_id])
+                    if backend in {"visual", "hybrid"}
+                    else None
+                ),
                 "metrics": metrics,
                 "top_k": ranked[: args.k],
                 "candidate_pool": ranked[: args.candidate_pool],
@@ -572,8 +857,19 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
         "gallery_count": len(unique_gallery_ids),
         "k": args.k,
         "candidate_pool": args.candidate_pool,
+        "retrieval_backend": backend,
+        "embedding_model": args.embedding_model if backend in {"visual", "hybrid"} else "",
+        "visual_top_n": args.visual_top_n if backend in {"visual", "hybrid"} else 0,
+        "visual_color_weight": args.visual_color_weight if backend in {"visual", "hybrid"} else 0.0,
+        "hybrid_visual_weight": args.hybrid_visual_weight if backend == "hybrid" else 0.0,
+        "visual_rescue_count": args.visual_rescue_count if backend == "hybrid" else 0,
+        "visual_rescue_margin": args.visual_rescue_margin if backend == "hybrid" else 0.0,
+        "visual_rescue_threshold": args.visual_rescue_threshold if backend == "hybrid" else 0.0,
+        "visual_summary": summarize_visual_analyses(visual_cache),
         "match_threshold": args.match_threshold,
         "ambiguous_threshold": args.ambiguous_threshold,
+        "visual_match_threshold": args.visual_match_threshold,
+        "visual_ambiguous_threshold": args.visual_ambiguous_threshold,
         "min_available_weight": args.min_available_weight,
         "same_camera_weights": same_camera_weights,
         "cross_camera_weights": cross_camera_weights,
@@ -598,6 +894,7 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
     dataset_summary = report["dataset_summary"]
     camera_pair_summary = report["camera_pair_summary"]
     queries = report["queries"]
+    visual_summary = report.get("visual_summary") or {}
     assert isinstance(summary, dict)
     assert isinstance(identity_summary, list)
     assert isinstance(dataset_summary, list)
@@ -623,6 +920,16 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
         fh.write(f"- Gallery count: `{report['gallery_count']}`\n")
         fh.write(f"- K: `{k}`\n")
         fh.write(f"- Candidate pool: `{pool_k}`\n")
+        fh.write(f"- Retrieval backend: `{report.get('retrieval_backend', 'profile')}`\n")
+        if report.get("embedding_model"):
+            fh.write(f"- Embedding model: `{report['embedding_model']}`\n")
+            fh.write(f"- Visual top-N crops: `{report['visual_top_n']}`\n")
+            fh.write(f"- Visual color weight: `{report['visual_color_weight']}`\n")
+            if report.get("retrieval_backend") == "hybrid":
+                fh.write(f"- Hybrid visual weight: `{report['hybrid_visual_weight']}`\n")
+                fh.write(f"- Visual rescue count: `{report.get('visual_rescue_count', 0)}`\n")
+                fh.write(f"- Visual rescue margin: `{report.get('visual_rescue_margin', 0.0)}`\n")
+                fh.write(f"- Visual rescue threshold: `{report.get('visual_rescue_threshold', 0.0)}`\n")
         fh.write(f"- Match threshold: `{report['match_threshold']}`\n")
         fh.write(f"- Ambiguous threshold: `{report['ambiguous_threshold']}`\n\n")
 
@@ -649,6 +956,11 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
         fh.write("## Summary Metrics\n\n")
         for key in sorted(summary):
             fh.write(f"- `{key}`: `{summary[key]}`\n")
+
+        if visual_summary:
+            fh.write("\n## Visual Crop Summary\n\n")
+            for key in sorted(visual_summary):
+                fh.write(f"- `{key}`: `{visual_summary[key]}`\n")
 
         fh.write("\n## Dataset Breakdown\n\n")
         fh.write(
@@ -703,11 +1015,13 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
             f"| query | dataset | identity | cam | gallery | available_positive_count | "
             f"max_possible_own_count_at_{k} | output_count | OwnCount@{k} | Wrong@{k} | "
             f"Precision@{k} | Recall@{k} | Normalized OwnRecall@{k} | insufficient_same_identity_gallery | "
-            "readiness | top candidates |\n"
+            "readiness | crop_quality | top candidates |\n"
         )
-        fh.write("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |\n")
+        fh.write("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | ---: | --- |\n")
         for row in queries:
             metrics = row["metrics"]
+            visual_analysis = row.get("visual_analysis") or {}
+            crop_quality = visual_analysis.get("best_crop_quality", "")
             top_candidates = ", ".join(
                 f"{candidate['candidate_id']}:{candidate['outcome']}:{candidate['retrieval_score']}"
                 for candidate in row["top_k"]
@@ -720,6 +1034,7 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
                 f"{metrics[f'precision_at_{k}']} | {metrics[f'recall_at_{k}']} | "
                 f"{metrics[f'normalized_own_recall_at_{k}']} | "
                 f"{metrics['insufficient_same_identity_gallery']} | {metrics['output_readiness']} | "
+                f"{crop_quality} | "
                 f"{top_candidates} |\n"
             )
 
@@ -783,6 +1098,32 @@ def write_debug_report(path: Path, report: dict[str, object]) -> None:
                     f"{candidate['retrieval_score']} | {candidate['outcome']} | {reasons} |\n"
                 )
 
+        if report.get("visual_summary"):
+            fh.write("\n## Low Quality Query Crops\n\n")
+            fh.write("| query | quality | selected_frame | reason | crop |\n")
+            fh.write("| --- | ---: | ---: | --- | --- |\n")
+            low_quality = sorted(
+                [
+                    row
+                    for row in queries
+                    if row.get("visual_analysis")
+                ],
+                key=lambda row: float((row.get("visual_analysis") or {}).get("best_crop_quality") or 0.0),
+            )[:10]
+            for row in low_quality:
+                visual = row.get("visual_analysis") or {}
+                top_crops = visual.get("top_crops") if isinstance(visual.get("top_crops"), list) else []
+                crop_path = top_crops[0].get("crop_path", "") if top_crops else ""
+                fh.write(
+                    f"| {row['query_id']} | {visual.get('best_crop_quality', '')} | "
+                    f"{visual.get('selected_frame_index', '')} | {visual.get('reason', '')} | {crop_path} |\n"
+                )
+
+            fh.write("\n## Next Tuning Suggestions\n\n")
+            fh.write("- If low-quality crops dominate, increase `--max-frames` or lower `--sample-every`.\n")
+            fh.write("- If same-clothing hard negatives dominate, try `--retrieval-backend hybrid`.\n")
+            fh.write("- If query/gallery angle mismatch dominates, increase `--visual-top-n` for tracklet averaging.\n")
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate labeled local clips as Top-K retrieval.")
@@ -808,12 +1149,43 @@ def main() -> int:
     parser.add_argument("--cross-camera-weights", default="")
     parser.add_argument("--allow-provisional", action="store_true", default=True)
     parser.add_argument("--no-allow-provisional", action="store_false", dest="allow_provisional")
+    parser.add_argument("--retrieval-backend", choices=("profile", "visual", "hybrid"), default="profile")
+    parser.add_argument(
+        "--embedding-model",
+        choices=("mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
+        default="mobilenet_v3_large",
+    )
+    parser.add_argument("--visual-top-n", type=int, default=1)
+    parser.add_argument("--visual-vote-frame-window", type=int, default=20)
+    parser.add_argument("--visual-color-weight", type=float, default=0.2)
+    parser.add_argument("--hybrid-visual-weight", type=float, default=0.35)
+    parser.add_argument("--visual-rescue-count", type=int, default=2)
+    parser.add_argument("--visual-rescue-margin", type=float, default=0.20)
+    parser.add_argument("--visual-rescue-threshold", type=float, default=0.60)
+    parser.add_argument("--visual-match-threshold", type=float, default=0.82)
+    parser.add_argument("--visual-ambiguous-threshold", type=float, default=0.55)
+    parser.add_argument("--crop-expand-ratio", type=float, default=0.1)
+    parser.add_argument("--save-debug-crops", action="store_true")
+    parser.add_argument("--visual-debug-dir", default="snapshots/reid_debug")
+    parser.add_argument("--embedding-cache-dir", default="logs/reid_embeddings")
     args = parser.parse_args()
 
     if args.k < 1:
         raise SystemExit("--k must be at least 1")
     if args.candidate_pool < args.k:
         raise SystemExit("--candidate-pool must be greater than or equal to --k")
+    if args.visual_top_n < 1:
+        raise SystemExit("--visual-top-n must be at least 1")
+
+    if args.retrieval_backend != "profile":
+        if args.output_json == "logs/topk_retrieval/results.json":
+            args.output_json = "logs/visual_topk_retrieval/results.json"
+        if args.output_md == "docs/reports/TOPK_RETRIEVAL_EVAL_REPORT.md":
+            args.output_md = "docs/reports/VISUAL_TOPK_RETRIEVAL_EVAL_REPORT.md"
+        if args.debug_md == "docs/reports/TOPK_RETRIEVAL_DEBUG_REPORT.md":
+            args.debug_md = "docs/reports/VISUAL_TOPK_DEBUG_REPORT.md"
+        if args.dataset_output_md == "docs/reports/TEST_CLIP_0527_EVAL_REPORT.md":
+            args.dataset_output_md = "docs/reports/TEST_CLIP_0527_VISUAL_EVAL_REPORT.md"
 
     report = evaluate_retrieval(args)
     json_path = resolve_inside_project(args.output_json)

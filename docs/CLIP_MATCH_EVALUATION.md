@@ -61,7 +61,8 @@ Run evaluation only on local project MP4 files:
 source .venv/bin/activate
 python scripts/evaluate_labeled_clips.py \
   --clips data/labels/clips.csv \
-  --pairs data/labels/pair_labels.csv
+  --pairs data/labels/pair_labels.csv \
+  --allow-provisional
 ```
 
 Outputs:
@@ -75,5 +76,13 @@ The evaluator preserves these outcomes:
 - `ambiguous`
 - `low_confidence`
 - `no_match`
+
+Default scoring uses appearance-weighted profile comparison with a `0.75` match threshold and `0.60` ambiguous threshold. Type A/B match flags and the original Type C-style raw score are still included in JSON as reference signals, but the report keeps uncertain cases as `ambiguous` or `low_confidence` instead of forcing a binary answer.
+
+Optional weight override format:
+
+```sh
+python scripts/evaluate_labeled_clips.py --weights top=1.4,bottom=1.0,bag=0.8
+```
 
 No camera, RTSP, TouchDesigner, full tracking, or long-running GUI tests are started by these manifest scripts. Generated logs remain under ignored `logs/`.

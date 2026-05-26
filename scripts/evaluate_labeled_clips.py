@@ -20,6 +20,15 @@ sys.path.insert(0, str(SRC_ROOT))
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 PROFILE_KEYS = ("top", "bottom", "bag", "is_long_sleeve", "is_long_pants", "torso_ratio", "brightness_ratio")
+DEFAULT_WEIGHTS = {
+    "top": 1.4,
+    "bottom": 1.0,
+    "bag": 0.8,
+    "is_long_sleeve": 0.7,
+    "is_long_pants": 0.5,
+    "torso_ratio": 1.0,
+    "brightness_ratio": 0.8,
+}
 
 
 @dataclass(frozen=True)
@@ -110,6 +119,20 @@ def person_rank(person: dict, frame_width: int) -> tuple[float, float, float]:
     return observed, -center_distance, area
 
 
+def profile_from_person_view(person: dict) -> dict[str, object]:
+    profile = {
+        "bag": "yes" if person.get("bags") else "no",
+        "is_long_sleeve": person.get("is_long_sleeve", "unknown"),
+        "is_long_pants": person.get("is_long_pants", "unknown"),
+        "torso_ratio": person.get("torso_ratio"),
+        "brightness_ratio": person.get("brightness_ratio"),
+    }
+    for region_name in ("top", "bottom"):
+        region = person.get("regions", {}).get(region_name)
+        profile[region_name] = region.get("color_name", "unknown") if region is not None else "unknown"
+    return profile
+
+
 def analyze_clip(analyzer, clip: ClipRecord, max_frames: int, sample_every: int) -> dict[str, object]:
     import cv2
 
@@ -129,6 +152,8 @@ def analyze_clip(analyzer, clip: ClipRecord, max_frames: int, sample_every: int)
     frames_analyzed = 0
     best_person = None
     best_profile = None
+    provisional_profile = None
+    provisional_frames = 0
     warning = None
     try:
         while frames_read < max_frames:
@@ -153,6 +178,8 @@ def analyze_clip(analyzer, clip: ClipRecord, max_frames: int, sample_every: int)
                 break
             if best_person is None or person_rank(person, frame_width) > person_rank(best_person, frame_width):
                 best_person = person
+                provisional_profile = profile_from_person_view(person)
+                provisional_frames = int(person.get("observed_frames") or frames_analyzed)
     finally:
         cap.release()
 
@@ -160,13 +187,17 @@ def analyze_clip(analyzer, clip: ClipRecord, max_frames: int, sample_every: int)
         reason = "no_finalized_profile"
         if frames_read == 0:
             reason = "no_frames_read"
+        if provisional_profile is not None:
+            reason = "provisional_profile_only"
         return {
-            "ok": False,
+            "ok": provisional_profile is not None,
             "clip_id": clip.clip_id,
             "reason": reason,
             "frames_read": frames_read,
             "frames_analyzed": frames_analyzed,
-            "profile": None,
+            "profile": provisional_profile,
+            "profile_status": "provisional" if provisional_profile is not None else "missing",
+            "provisional_observed_frames": provisional_frames,
             "warning": warning,
         }
 
@@ -177,6 +208,7 @@ def analyze_clip(analyzer, clip: ClipRecord, max_frames: int, sample_every: int)
         "frames_read": frames_read,
         "frames_analyzed": frames_analyzed,
         "profile": best_profile,
+        "profile_status": "finalized",
         "warning": warning,
     }
 
@@ -241,11 +273,60 @@ def type_c_raw_score(left: dict[str, object], right: dict[str, object]) -> float
     return (bag_similarity * 2.0) + torso_similarity + brightness_similarity
 
 
+def parse_weights(weights_text: str | None) -> dict[str, float]:
+    weights = DEFAULT_WEIGHTS.copy()
+    if not weights_text:
+        return weights
+    for item in weights_text.split(","):
+        if not item.strip():
+            continue
+        key, _, value = item.partition("=")
+        key = key.strip()
+        if key not in weights:
+            raise ValueError(f"Unsupported weight key: {key}")
+        weights[key] = float(value)
+    return weights
+
+
+def categorical_similarity(left: dict[str, object], right: dict[str, object], key: str) -> float:
+    if missing_profile_value(left.get(key)) or missing_profile_value(right.get(key)):
+        return 0.0
+    return 1.0 if left.get(key) == right.get(key) else 0.0
+
+
+def numeric_similarity(left: dict[str, object], right: dict[str, object], key: str, scale: float) -> float:
+    gap = numeric_gap(left, right, key)
+    if gap is None:
+        return 0.0
+    return 1.0 / (1.0 + (gap / scale))
+
+
+def weighted_similarity(left: dict[str, object], right: dict[str, object], weights: dict[str, float]) -> tuple[float, dict[str, float]]:
+    components = {
+        "top": categorical_similarity(left, right, "top"),
+        "bottom": categorical_similarity(left, right, "bottom"),
+        "bag": categorical_similarity(left, right, "bag"),
+        "is_long_sleeve": categorical_similarity(left, right, "is_long_sleeve"),
+        "is_long_pants": categorical_similarity(left, right, "is_long_pants"),
+        "torso_ratio": numeric_similarity(left, right, "torso_ratio", 0.12),
+        "brightness_ratio": numeric_similarity(left, right, "brightness_ratio", 0.45),
+    }
+    total_weight = sum(max(0.0, weights[key]) for key in components)
+    if total_weight <= 0.0:
+        return 0.0, components
+    score = sum(components[key] * max(0.0, weights[key]) for key in components) / total_weight
+    return score, components
+
+
 def compare_profiles(
     left: dict[str, object] | None,
     right: dict[str, object] | None,
     match_threshold: float,
     ambiguous_threshold: float,
+    weights: dict[str, float],
+    allow_provisional: bool,
+    left_status: str,
+    right_status: str,
 ) -> dict[str, object]:
     if not profile_valid(left) or not profile_valid(right):
         return {
@@ -259,12 +340,20 @@ def compare_profiles(
 
     assert left is not None and right is not None
     raw_score = type_c_raw_score(left, right)
-    matching_score = max(0.0, min(1.0, raw_score / 4.0))
+    matching_score, components = weighted_similarity(left, right, weights)
+    matching_score = max(0.0, min(1.0, matching_score))
     a_match = type_a_match(left, right)
     b_match = type_b_match(left, right)
     score_match = matching_score >= match_threshold
+    provisional = left_status != "finalized" or right_status != "finalized"
 
-    if score_match and (a_match or b_match):
+    if provisional and not allow_provisional:
+        outcome = "low_confidence"
+    elif provisional and score_match:
+        outcome = "ambiguous"
+    elif provisional:
+        outcome = "low_confidence"
+    elif score_match:
         outcome = "matched"
     elif matching_score >= ambiguous_threshold or len({a_match, b_match, score_match}) > 1:
         outcome = "ambiguous"
@@ -275,6 +364,7 @@ def compare_profiles(
         "outcome": outcome,
         "matching_score": round(matching_score, 4),
         "type_c_raw_score": round(raw_score, 4),
+        "weighted_components": {key: round(value, 4) for key, value in components.items()},
         "type_a_match": a_match,
         "type_b_match": b_match,
         "reason": "profile_comparison",
@@ -286,6 +376,7 @@ def evaluate_pairs(args: argparse.Namespace) -> dict[str, object]:
 
     clips = load_clips(resolve_inside_project(args.clips))
     pairs = load_pairs(resolve_inside_project(args.pairs))
+    weights = parse_weights(args.weights)
     analyzer = WalnutAnalyzer(vote_frame_window=args.vote_frame_window)
     profile_cache: dict[str, dict[str, object]] = {}
     results: list[dict[str, object]] = []
@@ -309,6 +400,10 @@ def evaluate_pairs(args: argparse.Namespace) -> dict[str, object]:
             right_result.get("profile"),
             match_threshold=args.match_threshold,
             ambiguous_threshold=args.ambiguous_threshold,
+            weights=weights,
+            allow_provisional=args.allow_provisional,
+            left_status=str(left_result.get("profile_status") or "missing"),
+            right_status=str(right_result.get("profile_status") or "missing"),
         )
         expected_same = pair["label"] == "1"
         predicted_same = comparison["outcome"] == "matched"
@@ -333,6 +428,10 @@ def evaluate_pairs(args: argparse.Namespace) -> dict[str, object]:
         "clips_path": args.clips,
         "pairs_path": args.pairs,
         "result_count": len(results),
+        "weights": weights,
+        "match_threshold": args.match_threshold,
+        "ambiguous_threshold": args.ambiguous_threshold,
+        "allow_provisional": args.allow_provisional,
         "results": results,
     }
 
@@ -346,6 +445,18 @@ def write_markdown_report(path: Path, report: dict[str, object]) -> None:
         fh.write(f"- Clips manifest: `{report['clips_path']}`\n")
         fh.write(f"- Pair labels: `{report['pairs_path']}`\n")
         fh.write(f"- Evaluated pairs: `{len(rows)}`\n\n")
+        outcome_counts: dict[str, int] = {}
+        status_counts: dict[str, int] = {}
+        for row in rows:
+            outcome_counts[str(row["outcome"])] = outcome_counts.get(str(row["outcome"]), 0) + 1
+            status_counts[str(row["evaluation_status"])] = status_counts.get(str(row["evaluation_status"]), 0) + 1
+        fh.write("## Summary\n\n")
+        fh.write(f"- Outcomes: `{outcome_counts}`\n")
+        fh.write(f"- Evaluation status: `{status_counts}`\n")
+        fh.write(f"- Weights: `{report.get('weights', {})}`\n\n")
+        fh.write(f"- Match threshold: `{report.get('match_threshold')}`\n")
+        fh.write(f"- Ambiguous threshold: `{report.get('ambiguous_threshold')}`\n")
+        fh.write(f"- Allow provisional profiles: `{report.get('allow_provisional')}`\n\n")
         fh.write("| pair_id | label | outcome | score | status | clip_a | clip_b |\n")
         fh.write("| --- | --- | --- | ---: | --- | --- | --- |\n")
         for row in rows:
@@ -365,8 +476,10 @@ def main() -> int:
     parser.add_argument("--max-frames", type=int, default=150)
     parser.add_argument("--sample-every", type=int, default=1)
     parser.add_argument("--vote-frame-window", type=int, default=75)
-    parser.add_argument("--match-threshold", type=float, default=0.80)
+    parser.add_argument("--match-threshold", type=float, default=0.75)
     parser.add_argument("--ambiguous-threshold", type=float, default=0.60)
+    parser.add_argument("--weights", default="")
+    parser.add_argument("--allow-provisional", action="store_true")
     args = parser.parse_args()
 
     json_path = resolve_inside_project(args.output_json)

@@ -77,12 +77,16 @@ The evaluator preserves these outcomes:
 - `low_confidence`
 - `no_match`
 
-Default scoring uses appearance-weighted profile comparison with a `0.75` match threshold and `0.60` ambiguous threshold. Type A/B match flags and the original Type C-style raw score are still included in JSON as reference signals, but the report keeps uncertain cases as `ambiguous` or `low_confidence` instead of forcing a binary answer.
+Default scoring builds a clip-level evidence profile from frame-level observations, then compares pairs with separate same-camera and cross-camera weights. The current tuned defaults use a `0.72` match threshold and `0.25` ambiguous threshold. Type A/B match flags and the original Type C-style raw score are still included in JSON as reference signals, but the report keeps uncertain cases as `ambiguous` or `low_confidence` instead of forcing a binary answer.
+
+The evaluator treats cross-camera brightness as weak evidence because camera exposure shifts are visible in the current clips. Strong contradiction rules can still produce `no_match` when stable appearance fields conflict together, such as `top` plus `bag`, or sleeve plus pants coverage.
 
 Optional weight override format:
 
 ```sh
 python scripts/evaluate_labeled_clips.py --weights top=1.4,bottom=1.0,bag=0.8
 ```
+
+The run also writes `docs/reports/CLIP_MATCH_CALIBRATION_REPORT.md`, which scans threshold and weight candidates against the current labeled clips as a development set. Treat this as a tuning aid, not as proof that the weights generalize to future exhibition footage.
 
 No camera, RTSP, TouchDesigner, full tracking, or long-running GUI tests are started by these manifest scripts. Generated logs remain under ignored `logs/`.

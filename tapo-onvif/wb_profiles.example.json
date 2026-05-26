@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "defaults": {
+    "algorithm": {
+      "k": 18.0,
+      "max_step": 4,
+      "min_gain": 0,
+      "max_gain": 100,
+      "target_channel": "G",
+      "dark_threshold": 10,
+      "clip_threshold": 245,
+      "min_valid_ratio": 0.5,
+      "max_clipped_ratio": 0.2,
+      "max_dark_ratio": 0.5,
+      "max_patch_std": 35.0,
+      "neutral_error_threshold": 0.04
+    }
+  },
+  "cameras": {
+    "c210_1f": {
+      "model": "Tapo C210",
+      "ip": "192.168.1.9",
+      "rtsp_url_env": "TAPO_C210_1F_RTSP_URL",
+      "tapo_username_env": "TAPO_CAMERA_ID",
+      "tapo_password_env": "TAPO_CAMERA_PW",
+      "setter_method": "setDayNightModeConfig",
+      "angles": {
+        "entrance": {
+          "label": "1F entrance test angle",
+          "roi": {
+            "x": 640,
+            "y": 360,
+            "size": 21,
+            "nx": 0.5,
+            "ny": 0.5,
+            "size_ratio": 0.029167,
+            "base_width": 1280,
+            "base_height": 720,
+            "note": "mock/default center; replace with wb_roi_picker.py"
+          },
+          "gains": {
+            "R": 50,
+            "G": 50,
+            "B": 50
+          }
+        }
+      }
+    }
+  }
+}

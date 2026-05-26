@@ -42,6 +42,9 @@ data/test_images/
 .env
 .env.*
 *.local
+!tapo-onvif/.env.example
+tapo-onvif/wb_profiles.json
+*.tmp
 
 # Large generated outputs
 outputs/

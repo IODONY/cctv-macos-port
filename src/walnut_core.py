@@ -1,15 +1,18 @@
 import time
 from collections import Counter, deque
+import os
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from ultralytics import YOLO
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = PROJECT_ROOT / "models"
+os.environ.setdefault("YOLO_CONFIG_DIR", str(PROJECT_ROOT / "logs" / "ultralytics"))
+
+from ultralytics import YOLO
 
 
 class WalnutAnalyzer:

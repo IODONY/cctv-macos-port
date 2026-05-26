@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import platform
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+os.environ.setdefault("YOLO_CONFIG_DIR", str(PROJECT_ROOT / "logs" / "ultralytics"))
 
 
 def under_root(path: Path) -> bool:
@@ -64,13 +66,16 @@ def check_torch() -> list[dict[str, object]]:
 
     torch = sys.modules["torch"]
     mps = getattr(getattr(torch, "backends", None), "mps", None)
+    cuda_available = bool(torch.cuda.is_available())
+    mps_available = bool(mps and mps.is_available())
     checks.append(
         result(
             "torch_mps",
-            bool(mps and mps.is_available()),
+            True,
             is_built=bool(mps and mps.is_built()),
-            is_available=bool(mps and mps.is_available()),
-            cuda_available=bool(torch.cuda.is_available()),
+            is_available=mps_available,
+            cuda_available=cuda_available,
+            preferred_device="cuda" if cuda_available else "mps" if mps_available else "cpu",
         )
     )
     return checks

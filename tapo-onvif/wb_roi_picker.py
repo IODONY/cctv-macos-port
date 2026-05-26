@@ -3,7 +3,7 @@
 
 Camera-less examples:
   python wb_roi_picker.py --camera c210_1f --angle entrance --mock
-  python wb_roi_picker.py --camera c210_1f --angle entrance --mock --headless-save --x 640 --y 360 --size 21
+  python wb_roi_picker.py --camera c210_1f --angle entrance --mock --headless-save --x 640 --y 360 --size 5
   python wb_roi_picker.py --camera c210_1f --angle entrance --image ./sample.jpg
 """
 
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtsp-url", help="Explicit RTSP URL. Avoid saving passwords in profile JSON.")
     parser.add_argument("--x", type=int, help="Headless ROI center x")
     parser.add_argument("--y", type=int, help="Headless ROI center y")
-    parser.add_argument("--size", type=int, default=21, help="ROI size in pixels; odd values are preferred")
+    parser.add_argument("--size", type=int, default=5, help="ROI size in pixels; odd values are preferred")
     parser.add_argument("--headless-save", action="store_true", help="Save ROI from --x/--y/--size without opening UI")
     parser.add_argument("--apply-on-save", action="store_true", help="When s is pressed, save the ROI, apply proposed WB gains, and refresh the preview frame")
     parser.add_argument("--force", action="store_true", help="With --apply-on-save, apply even if ROI safety checks fail")

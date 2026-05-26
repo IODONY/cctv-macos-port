@@ -25,7 +25,7 @@ python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entr
 Headless ROI save without a UI:
 
 ```bash
-python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entrance --mock --headless-save --x 640 --y 360 --size 21
+python wb_roi_picker.py --profile wb_profiles.json --camera c210_1f --angle entrance --mock --headless-save --x 640 --y 360 --size 5
 ```
 
 ## Later, after the Tapo account unlocks

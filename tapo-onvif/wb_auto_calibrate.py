@@ -56,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
 def read_frame(args: argparse.Namespace, camera: Dict[str, Any], angle: Dict[str, Any]):
     if args.mock:
         rgb = parse_rgb(args.mock_rgb)
-        roi = angle.get("roi") or {"x": 640, "y": 360, "size": 21, "base_width": 1280, "base_height": 720}
+        roi = angle.get("roi") or {"x": 640, "y": 360, "size": 5, "base_width": 1280, "base_height": 720}
         resolved = resolve_roi(roi, 1280, 720)
         return create_mock_frame(patch_center=(resolved["x"], resolved["y"]), patch_rgb=rgb)
     if args.image:

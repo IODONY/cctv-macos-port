@@ -30,10 +30,10 @@
           "roi": {
             "x": 640,
             "y": 360,
-            "size": 21,
+            "size": 5,
             "nx": 0.5,
             "ny": 0.5,
-            "size_ratio": 0.029167,
+            "size_ratio": 0.006944,
             "base_width": 1280,
             "base_height": 720,
             "note": "mock/default center; replace with wb_roi_picker.py"

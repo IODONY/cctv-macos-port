@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 DEFAULT_GAINS: Dict[str, int] = {"R": 50, "G": 50, "B": 50}
+DEFAULT_ROI_SIZE = 5
 DEFAULT_ALGORITHM: Dict[str, Any] = {
     "k": 18.0,
     "max_step": 4,
@@ -152,13 +153,13 @@ def resolve_roi(roi: Dict[str, Any], frame_width: int, frame_height: int) -> Dic
         if "size_ratio" in roi:
             size = int(round(float(roi["size_ratio"]) * min(frame_width, frame_height)))
         else:
-            size = int(roi.get("size", 21))
+            size = int(roi.get("size", DEFAULT_ROI_SIZE))
     else:
         base_w = int(roi.get("base_width", frame_width))
         base_h = int(roi.get("base_height", frame_height))
         x = int(round(float(roi["x"]) * frame_width / max(1, base_w)))
         y = int(round(float(roi["y"]) * frame_height / max(1, base_h)))
-        size = int(round(float(roi.get("size", 21)) * min(frame_width, frame_height) / max(1, min(base_w, base_h))))
+        size = int(round(float(roi.get("size", DEFAULT_ROI_SIZE)) * min(frame_width, frame_height) / max(1, min(base_w, base_h))))
 
     size = max(3, size)
     if size % 2 == 0:

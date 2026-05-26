@@ -17,7 +17,8 @@ from typing import Any, Dict, Optional
 from wb_core import clamp_gain, normalize_gains
 
 DEFAULT_SETTER_METHOD = "setDayNightModeConfig"
-DEFAULT_EXPOSURE_STEP = 10
+DEFAULT_EXPOSURE_FIELD = "exp_gain"
+DEFAULT_EXPOSURE_STEP = 100
 
 
 def default_backup_dir() -> Path:
@@ -58,14 +59,16 @@ def clamp_exposure_level(value: Any, min_level: int | None = None, max_level: in
 def build_exposure_payload(
     level: Any,
     exp_type: str = "auto",
+    field: str = DEFAULT_EXPOSURE_FIELD,
     min_level: int | None = None,
     max_level: int | None = None,
 ) -> Dict[str, Any]:
+    field = str(field or DEFAULT_EXPOSURE_FIELD)
     return {
         "image": {
             "common": {
                 "exp_type": str(exp_type),
-                "exp_level": str(clamp_exposure_level(level, min_level=min_level, max_level=max_level)),
+                field: str(clamp_exposure_level(level, min_level=min_level, max_level=max_level)),
             }
         }
     }
@@ -107,18 +110,19 @@ class TapoWBClient:
         payload = build_manual_wb_payload(gains, wb_type=wb_type)
         return self.tapo.executeFunction(self.setter_method, payload)
 
-    def get_exposure_level(self, default: int = 0) -> int:
+    def get_exposure_level(self, default: int = 0, field: str = DEFAULT_EXPOSURE_FIELD) -> int:
         common = self.get_image_common()
-        return clamp_exposure_level(common.get("exp_level", default))
+        return clamp_exposure_level(common.get(str(field or DEFAULT_EXPOSURE_FIELD), default))
 
     def apply_exposure_level(
         self,
         level: Any,
         exp_type: str = "auto",
+        field: str = DEFAULT_EXPOSURE_FIELD,
         min_level: int | None = None,
         max_level: int | None = None,
     ) -> Dict[str, Any]:
-        payload = build_exposure_payload(level, exp_type=exp_type, min_level=min_level, max_level=max_level)
+        payload = build_exposure_payload(level, exp_type=exp_type, field=field, min_level=min_level, max_level=max_level)
         return self.tapo.executeFunction(self.setter_method, payload)
 
 

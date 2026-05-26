@@ -34,6 +34,7 @@ from wb_core import (
     save_profiles,
 )
 from tapo_wb_client import (
+    DEFAULT_EXPOSURE_FIELD,
     DEFAULT_EXPOSURE_STEP,
     clamp_exposure_level,
     client_from_camera_profile,
@@ -63,9 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-error", type=float, help="Override target neutral error threshold")
     parser.add_argument("--k", type=float, help="Override controller strength for --apply-on-save")
     parser.add_argument("--max-step", type=float, help="Override max gain step per save for --apply-on-save")
-    parser.add_argument("--exposure-level", type=int, help="Set exposure compensation level before automatic WB on exit")
-    parser.add_argument("--exposure-type", default="manual", help="Exposure mode sent with exp_level; use auto to restore previous behavior")
-    parser.add_argument("--exposure-step", type=int, default=DEFAULT_EXPOSURE_STEP, help="Exposure compensation step for -/= keys")
+    parser.add_argument("--exposure-level", type=int, help="Set exposure gain value before automatic WB on exit")
+    parser.add_argument("--exposure-type", default="manual", help="Exposure mode sent with exposure gain; use auto to restore previous behavior")
+    parser.add_argument("--exposure-field", default=DEFAULT_EXPOSURE_FIELD, help="Tapo image.common field changed by -/= keys")
+    parser.add_argument("--exposure-step", type=int, default=DEFAULT_EXPOSURE_STEP, help="Exposure gain step for -/= keys")
     parser.add_argument("--exposure-settle", type=float, default=0.2, help="Seconds to wait after exposure key changes")
     parser.add_argument("--exposure-min", type=int, help="Optional minimum exposure compensation level")
     parser.add_argument("--exposure-max", type=int, help="Optional maximum exposure compensation level")
@@ -177,7 +179,7 @@ def adjust_exposure(
     client = ensure_client(camera, state)
     current = state.get("exposure_level")
     if current is None:
-        current = client.get_exposure_level()
+        current = client.get_exposure_level(field=args.exposure_field)
 
     step = max(1, abs(int(args.exposure_step)))
     proposed = clamp_exposure_level(
@@ -190,12 +192,21 @@ def adjust_exposure(
         return
 
     print(f"[APPLY] exposure {current} -> {proposed}")
-    result = client.apply_exposure_level(
-        proposed,
-        exp_type=args.exposure_type,
-        min_level=args.exposure_min,
-        max_level=args.exposure_max,
-    )
+    try:
+        result = client.apply_exposure_level(
+            proposed,
+            exp_type=args.exposure_type,
+            field=args.exposure_field,
+            min_level=args.exposure_min,
+            max_level=args.exposure_max,
+        )
+    except Exception as exc:
+        state["message"] = f"exposure rejected: {proposed}"
+        print(json.dumps({"set_error": str(exc), "proposed": proposed, "field": args.exposure_field}, ensure_ascii=False, indent=2))
+        pending = drain_pending_keys()
+        if ord("q") in pending or 27 in pending:
+            state["quit_requested"] = True
+        return
     print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
     state["exposure_level"] = proposed
     time.sleep(max(0.0, float(args.exposure_settle)))
@@ -230,12 +241,17 @@ def apply_exposure_setting(args: argparse.Namespace, camera: Dict[str, Any], roi
         max_level=args.exposure_max,
     )
     print(f"[APPLY] exposure -> {proposed}")
-    result = client.apply_exposure_level(
-        proposed,
-        exp_type=args.exposure_type,
-        min_level=args.exposure_min,
-        max_level=args.exposure_max,
-    )
+    try:
+        result = client.apply_exposure_level(
+            proposed,
+            exp_type=args.exposure_type,
+            field=args.exposure_field,
+            min_level=args.exposure_min,
+            max_level=args.exposure_max,
+        )
+    except Exception as exc:
+        print(json.dumps({"set_error": str(exc), "proposed": proposed, "field": args.exposure_field}, ensure_ascii=False, indent=2))
+        return None
     print(json.dumps({"set_response": result}, ensure_ascii=False, indent=2))
     state["exposure_level"] = proposed
     time.sleep(max(0.0, min(float(args.settle), 1.5)))
@@ -309,6 +325,8 @@ def apply_roi_on_exit(
         "angle": args.angle,
         "target_kelvin": algorithm.get("target_kelvin"),
         "target_error": algorithm["neutral_error_threshold"],
+        "exposure_type": args.exposure_type,
+        "exposure_field": args.exposure_field,
         "exposure_level": state.get("exposure_level"),
         "iterations": [],
     }
@@ -316,6 +334,8 @@ def apply_roi_on_exit(
     if args.exposure_level is not None:
         report["exposure_level"] = apply_exposure_setting(args, camera, roi, state)
     elif state.get("exposure_level") is not None:
+        angle["exposure_type"] = args.exposure_type
+        angle["exposure_field"] = args.exposure_field
         angle["exposure_level"] = state["exposure_level"]
         save_profiles(profile_path, profiles)
 
@@ -354,7 +374,7 @@ def apply_roi_on_exit(
         refresh_frame(args, camera, roi, state)
 
     common = ensure_client(camera, state).get_image_common()
-    summary = {k: common.get(k) for k in ("exp_type", "exp_level", "wb_type", "wb_R_gain", "wb_G_gain", "wb_B_gain") if k in common}
+    summary = {k: common.get(k) for k in ("exp_type", "exp_level", "exp_gain", "shutter", "wb_type", "wb_R_gain", "wb_G_gain", "wb_B_gain") if k in common}
     print(json.dumps({"readback_ok": True, "camera_ip": camera.get("ip"), "image_common": summary}, ensure_ascii=False, indent=2))
     return 0
 

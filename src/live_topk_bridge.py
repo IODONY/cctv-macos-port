@@ -2,10 +2,10 @@
 """Live YOLO person clips -> appearance embedding -> Top-K OSC bridge.
 
 This runtime is intentionally track-centric:
-- Gallery cameras record one cropped clip per detected local person track.
+- Gallery cameras record one full-frame clip per detected local person track.
 - Recording starts when YOLO first sees the person and ends when that track
   disappears for a small grace window.
-- Each finished track stores a best ReID crop and an appearance embedding.
+- Each finished track stores a cropped best ReID frame and an appearance embedding.
 - Query cameras periodically embed the current target person and send ranked
   clip paths to TouchDesigner.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
 import shutil
 import sys
@@ -42,6 +43,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_ROOT = PROJECT_ROOT / "logs" / "model_cache" / "torch"
 GALLERY_TYPES = {"A", "B", "G"}
 QUERY_TYPES = {"C", "Q"}
+PREVIEW_LOCK = threading.Lock()
+PREVIEW_QUEUE: queue.Queue[tuple[str, np.ndarray, float]] = queue.Queue(maxsize=12)
+PREVIEW_DISABLED = False
+PREVIEW_ERROR_REPORTED = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,6 +85,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-interval", type=int, default=2)
     parser.add_argument("--print-interval-frames", type=int, default=60)
     parser.add_argument("--snapshot-dir", default="snapshots/live_topk")
+    parser.add_argument(
+        "--record-video-mode",
+        choices=("full-frame", "person-crop"),
+        default="full-frame",
+        help="Record full original frames per track, or the older cropped person video.",
+    )
+    parser.add_argument("--show-preview", action="store_true", help="Show live annotated camera preview windows.")
+    parser.add_argument(
+        "--preview-scale",
+        type=float,
+        default=0.65,
+        help="Scale factor for preview windows.",
+    )
+    parser.add_argument(
+        "--preview-reid-crops",
+        action="store_true",
+        help="Show the latest selected ReID crop when a gallery track is embedded.",
+    )
     parser.add_argument(
         "--storage-layout",
         choices=("camera", "similarity"),
@@ -421,6 +444,93 @@ def resize_with_padding(image: np.ndarray, output_size: tuple[int, int]) -> np.n
     return canvas
 
 
+def resize_frame_if_needed(frame: np.ndarray, output_size: tuple[int, int]) -> np.ndarray:
+    target_w, target_h = output_size
+    height, width = frame.shape[:2]
+    if (width, height) == (target_w, target_h):
+        return frame
+    return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+
+def draw_analysis_overlay(
+    frame: np.ndarray,
+    people: list[dict[str, object]],
+    cam_id: int,
+    cam_label: str,
+    role: str,
+    gallery_count: int,
+    active_recordings: int,
+    inference_ms: float,
+) -> np.ndarray:
+    preview = frame.copy()
+    for person in people:
+        x1, y1, x2, y2 = [int(value) for value in person.get("box", (0, 0, 0, 0))]
+        track_id = int(person.get("track_id", 0))
+        confidence = float(person.get("confidence", 0.0))
+        color = (40, 220, 80) if role == "G" else (70, 170, 255)
+        cv2.rectangle(preview, (x1, y1), (x2, y2), color, 2)
+        label = f"id {track_id} conf {confidence:.2f}"
+        cv2.putText(preview, label, (x1, max(18, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+    status = (
+        f"cam_{cam_id} {cam_label} role={role} people={len(people)} "
+        f"recording={active_recordings} gallery={gallery_count} yolo={inference_ms:.1f}ms"
+    )
+    cv2.rectangle(preview, (0, 0), (preview.shape[1], 34), (0, 0, 0), -1)
+    cv2.putText(preview, status, (10, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
+    return preview
+
+
+def enqueue_preview_window(window_name: str, frame: np.ndarray, scale: float) -> None:
+    if PREVIEW_DISABLED:
+        return
+    try:
+        PREVIEW_QUEUE.put_nowait((window_name, frame.copy(), scale))
+    except queue.Full:
+        try:
+            PREVIEW_QUEUE.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            PREVIEW_QUEUE.put_nowait((window_name, frame.copy(), scale))
+        except queue.Full:
+            pass
+
+
+def render_preview_window(window_name: str, frame: np.ndarray, scale: float) -> int:
+    display = frame
+    if scale > 0 and abs(scale - 1.0) > 1e-3:
+        width = max(1, int(round(frame.shape[1] * scale)))
+        height = max(1, int(round(frame.shape[0] * scale)))
+        display = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    cv2.imshow(window_name, display)
+    return cv2.waitKey(1) & 0xFF
+
+
+def process_preview_events() -> bool:
+    global PREVIEW_DISABLED, PREVIEW_ERROR_REPORTED
+    if PREVIEW_DISABLED:
+        return False
+    should_stop = False
+    with PREVIEW_LOCK:
+        while True:
+            try:
+                window_name, frame, scale = PREVIEW_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                key = render_preview_window(window_name, frame, scale)
+            except cv2.error as exc:
+                PREVIEW_DISABLED = True
+                if not PREVIEW_ERROR_REPORTED:
+                    print(f"[preview] OpenCV window preview disabled: {exc}")
+                    PREVIEW_ERROR_REPORTED = True
+                break
+            if key in (ord("q"), 27):
+                should_stop = True
+    return should_stop
+
+
 def crop_quality(crop: np.ndarray | None, person: dict[str, object]) -> float:
     if crop is None or crop.size == 0:
         return 0.0
@@ -612,6 +722,7 @@ class PersonClipRecorder:
         track_id: int,
         output_size: tuple[int, int],
         fps: float,
+        record_video_mode: str,
     ):
         event_id = str(int(time.time() * 1000))
         safe_session = sanitize_id(session_id)
@@ -626,6 +737,7 @@ class PersonClipRecorder:
         self.clip_path = clip_dir / f"{clip_id}.mp4"
         self.best_frame_path = clip_dir / f"{clip_id}_best.jpg"
         self.output_size = output_size
+        self.record_video_mode = record_video_mode
         self.writer, self.codec = create_clip_writer(self.clip_path, fps, output_size)
         self.started_at = time.monotonic()
         self.created_at = time.time()
@@ -654,10 +766,13 @@ class PersonClipRecorder:
     def write_frame(self, frame: np.ndarray) -> None:
         if self.writer is None or self.last_box is None or self.closed:
             return
-        crop = visual_crop_person(frame, self.last_box)
-        if crop is None:
-            return
-        self.writer.write(visual_resize_with_padding(crop, self.output_size))
+        if self.record_video_mode == "person-crop":
+            crop = visual_crop_person(frame, self.last_box)
+            if crop is None:
+                return
+            self.writer.write(visual_resize_with_padding(crop, self.output_size))
+        else:
+            self.writer.write(resize_frame_if_needed(frame, self.output_size))
         self.frame_count += 1
 
     def should_force_close(self, max_clip_seconds: float) -> bool:
@@ -885,6 +1000,7 @@ class LiveTopKCameraWorker(threading.Thread):
             else:
                 self._handle_query_people(frame, people)
             self._send_status(people)
+            self._show_analysis_preview(frame, people)
 
             if self.analyzed_frames % max(1, self.args.print_interval_frames) == 0:
                 print(
@@ -912,14 +1028,18 @@ class LiveTopKCameraWorker(threading.Thread):
                 continue
             recorder = self.recorders.get(track_id)
             if recorder is None:
+                output_size = self.output_size
+                if self.args.record_video_mode == "full-frame":
+                    output_size = (int(frame.shape[1]), int(frame.shape[0]))
                 recorder = PersonClipRecorder(
                     self.session_id,
                     self.snapshot_root,
                     self.cam_id,
                     self.cam_label,
                     track_id,
-                    self.output_size,
+                    output_size,
                     fps=30.0,
+                    record_video_mode=str(self.args.record_video_mode),
                 )
                 self.recorders[track_id] = recorder
             recorder.observe(frame, person)
@@ -1004,6 +1124,25 @@ class LiveTopKCameraWorker(threading.Thread):
         self.osc.send(f"{base}/gallery_count", int(self.gallery.count()))
         self.osc.send(f"{base}/active_recordings", int(len(self.recorders)))
 
+    def _show_analysis_preview(self, frame: np.ndarray, people: list[dict[str, object]]) -> None:
+        if not self.args.show_preview:
+            return
+        preview = draw_analysis_overlay(
+            frame,
+            people,
+            self.cam_id,
+            self.cam_label,
+            self.cam_type,
+            self.gallery.count(),
+            len(self.recorders),
+            self.analyzer.last_inference_ms,
+        )
+        enqueue_preview_window(
+            f"YOLO/ReID analysis - cam_{self.cam_id} {self.cam_label}",
+            preview,
+            float(self.args.preview_scale),
+        )
+
     def _export_topk_results(self, query_crop: np.ndarray | None, payload: dict[str, object]) -> str:
         if not str(self.args.export_topk_dir or "").strip():
             return ""
@@ -1055,6 +1194,18 @@ class LiveTopKCameraWorker(threading.Thread):
         record = recorder.close(self.embedder, reason)
         if record is None:
             return
+        if self.args.show_preview and self.args.preview_reid_crops and recorder.best_crop is not None:
+            crop_preview = recorder.best_crop.copy()
+            cv2.putText(
+                crop_preview,
+                f"ReID crop {record.cam_label} track={record.track_id} q={record.quality:.2f}",
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (255, 255, 255),
+                2,
+            )
+            enqueue_preview_window("ReID selected best crops", crop_preview, 1.0)
         if self.args.storage_layout == "similarity":
             group = self.gallery.assign_similarity_group(record, float(self.args.similarity_group_threshold))
             record.similarity_group_id = int(group["group_id"])
@@ -1121,6 +1272,9 @@ def main() -> int:
     print(f"Session: {session_id}")
     print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
+    print(f"Record video mode: {args.record_video_mode}")
+    if args.show_preview:
+        print("Preview windows: enabled. Press q or Esc in a preview window to stop.")
     print(
         f"Storage layout: {args.storage_layout} "
         f"similarity_threshold={args.similarity_group_threshold} "
@@ -1153,7 +1307,10 @@ def main() -> int:
 
     try:
         while any(worker.is_alive() for worker in workers):
-            time.sleep(0.5)
+            if args.show_preview and process_preview_events():
+                stop_event.set()
+                break
+            time.sleep(0.03 if args.show_preview else 0.5)
     except KeyboardInterrupt:
         print("\nStopping live Top-K bridge...")
         stop_event.set()
@@ -1161,6 +1318,9 @@ def main() -> int:
         stop_event.set()
         for worker in workers:
             worker.join(timeout=5.0)
+        if args.show_preview:
+            with PREVIEW_LOCK:
+                cv2.destroyAllWindows()
 
     print(f"Stopped. Gallery records: {gallery.count()}")
     return 0

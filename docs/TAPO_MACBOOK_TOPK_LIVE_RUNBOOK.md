@@ -70,7 +70,10 @@ python src/live_topk_bridge.py \
   --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL \
   --cam-types G,G,G \
   --cam-labels tapo_1,tapo_2,tapo_3 \
+  --record-video-mode full-frame \
   --storage-layout similarity \
+  --show-preview \
+  --preview-reid-crops \
   --max-runtime-seconds 120 \
   --disable-osc
 ```
@@ -116,8 +119,8 @@ For a short smoke test, add:
 
 Generated runtime files stay under ignored folders:
 
-- `snapshots/live_topk/<session>/cam_N/*.mp4`: cropped per-person track clips.
-- `snapshots/live_topk/<session>/cam_N/*_best.jpg`: best ReID crop per track.
+- `snapshots/live_topk/<session>/cam_N/*.mp4`: per-person track clips. With the default `--record-video-mode full-frame`, these are full original frames, not cropped person videos.
+- `snapshots/live_topk/<session>/cam_N/*_best.jpg`: cropped best ReID frame per track.
 - `snapshots/live_topk/<session>/similarity_groups/group_NNN/`: optional appearance-similarity review folders when `--storage-layout similarity` is used.
 - `snapshots/topk_exports/<session>/<query_id>/results.json`: ranked clips selected for one MacBook query event.
 - `snapshots/topk_exports/<session>/<query_id>/query_best.jpg`: query crop used for ranking.
@@ -172,6 +175,10 @@ Important CLI parameters:
 - `--clip-width 320 --clip-height 640`: cropped person clip resolution.
 - `--fallback-score 0.55`: score below which a result is considered fallback.
 - `--cam-labels ...`: physical camera labels that stay attached to logs, exports, and OSC side channels.
+- `--record-video-mode full-frame`: save full-frame video per detected person track while keeping ReID crops separate.
+- `--record-video-mode person-crop`: legacy mode that records cropped person videos.
+- `--show-preview`: open annotated YOLO/ReID analysis windows.
+- `--preview-reid-crops`: also show the selected ReID crop whenever a track is embedded.
 - `--storage-layout similarity`: mirror gallery clips into appearance-similarity folders for debugging.
 - `--similarity-group-threshold 0.72`: grouping threshold for that temporary review layout.
 - `--export-topk-dir snapshots/topk_exports`: query-by-query export bundles for TouchDesigner-free testing.

@@ -19,31 +19,27 @@ This is appearance-based retrieval. The live runtime does not know identity labe
 
 Use environment variables for Tapo RTSP URLs. Do not commit RTSP credentials.
 
-Current 5-camera gallery test mapping:
+Current LAN gallery test mapping:
 
 | runtime role | physical camera | IP address | label |
 | --- | ---: | --- | --- |
-| gallery | 1 | `192.168.1.12` | `tapo_1` |
-| gallery | 2 | `192.168.1.6` | `tapo_2` |
-| gallery | 3 | `192.168.1.8` | `tapo_3` |
-| gallery | 5 | `192.168.1.7` | `tapo_5` |
-| gallery | 9 | `192.168.1.9` | `tapo_9` |
+| gallery | 1 | `192.168.5.59` | `tapo_1` |
+| gallery | 2 | `192.168.5.57` | `tapo_2` |
+| gallery | 3 | `192.168.5.64` | `tapo_3` |
 | query | MacBook internal camera | `webcam:0` | `macbook_query` |
 
 Set RTSP URLs in the local shell only. The URL pattern is:
 
 ```text
-rtsp://<camera-user>:<camera-password>@192.168.1.<ip-suffix>
+rtsp://<camera-user>:<camera-password>@<camera-ip>/stream1
 ```
 
 Example local setup:
 
 ```bash
-export TAPO_CAM_1_RTSP_URL='rtsp://<user>:<password>@192.168.1.12'
-export TAPO_CAM_2_RTSP_URL='rtsp://<user>:<password>@192.168.1.6'
-export TAPO_CAM_3_RTSP_URL='rtsp://<user>:<password>@192.168.1.8'
-export TAPO_CAM_5_RTSP_URL='rtsp://<user>:<password>@192.168.1.7'
-export TAPO_CAM_9_RTSP_URL='rtsp://<user>:<password>@192.168.1.9'
+export TAPO_CAM_1_RTSP_URL='rtsp://<user>:<password>@192.168.5.59/stream1'
+export TAPO_CAM_2_RTSP_URL='rtsp://<user>:<password>@192.168.5.57/stream1'
+export TAPO_CAM_3_RTSP_URL='rtsp://<user>:<password>@192.168.5.64/stream1'
 ```
 
 If a base RTSP URL does not open for a specific Tapo model, try the same environment variable with `/stream1` or `/stream2` appended.
@@ -66,27 +62,27 @@ python src/live_topk_bridge.py \
   --disable-osc
 ```
 
-Then test all five gallery cameras:
+Then test all three gallery cameras:
 
 ```bash
 source .venv/bin/activate
 python src/live_topk_bridge.py \
-  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL,TAPO_CAM_5_RTSP_URL,TAPO_CAM_9_RTSP_URL \
-  --cam-types G,G,G,G,G \
-  --cam-labels tapo_1,tapo_2,tapo_3,tapo_5,tapo_9 \
+  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL \
+  --cam-types G,G,G \
+  --cam-labels tapo_1,tapo_2,tapo_3 \
   --max-runtime-seconds 120 \
   --disable-osc
 ```
 
-Finally run five Tapo gallery cameras plus the MacBook query camera. This test does not require TouchDesigner; every query event exports the selected clips into the workspace.
+Finally run three Tapo gallery cameras plus the MacBook query camera. This test does not require TouchDesigner; every query event exports the selected clips into the workspace.
 
 ```bash
 source .venv/bin/activate
 python src/live_topk_bridge.py \
-  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL,TAPO_CAM_5_RTSP_URL,TAPO_CAM_9_RTSP_URL \
+  --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL \
   --rtsp webcam:0 \
-  --cam-types G,G,G,G,G,Q \
-  --cam-labels tapo_1,tapo_2,tapo_3,tapo_5,tapo_9,macbook_query \
+  --cam-types G,G,G,Q \
+  --cam-labels tapo_1,tapo_2,tapo_3,macbook_query \
   --topk 7 \
   --export-topk-dir snapshots/topk_exports \
   --export-mode symlink \

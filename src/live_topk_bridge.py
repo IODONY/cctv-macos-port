@@ -80,6 +80,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inference-interval", type=int, default=2)
     parser.add_argument("--print-interval-frames", type=int, default=60)
     parser.add_argument("--snapshot-dir", default="snapshots/live_topk")
+    parser.add_argument(
+        "--storage-layout",
+        choices=("camera", "similarity"),
+        default="camera",
+        help="Use camera folders only, or add a similarity-grouped review view for gallery clips.",
+    )
+    parser.add_argument(
+        "--similarity-group-threshold",
+        type=float,
+        default=0.72,
+        help="Cosine threshold for assigning gallery clips to the same temporary appearance group.",
+    )
+    parser.add_argument(
+        "--similarity-export-mode",
+        choices=("symlink", "copy", "path"),
+        default="symlink",
+        help="How to place gallery clips in similarity group folders.",
+    )
+    parser.add_argument(
+        "--similarity-min-frames",
+        type=int,
+        default=1,
+        help="Minimum recorded frames required before a clip is mirrored into a similarity group folder.",
+    )
     parser.add_argument("--clip-width", type=int, default=320)
     parser.add_argument("--clip-height", type=int, default=640)
     parser.add_argument("--track-missing-grace", type=int, default=8)
@@ -323,6 +347,45 @@ def export_asset(source_path: str, destination: Path, mode: str, path_txt_name: 
     return str((destination.parent.resolve() / destination.name)).replace("\\", "/")
 
 
+def export_similarity_group_record(
+    record: GalleryRecord,
+    snapshot_root: Path,
+    session_id: str,
+    export_mode: str,
+) -> str:
+    if not record.similarity_group_label:
+        return ""
+
+    group_dir = (
+        snapshot_root
+        / sanitize_id(session_id)
+        / "similarity_groups"
+        / sanitize_id(record.similarity_group_label)
+    )
+    group_dir.mkdir(parents=True, exist_ok=True)
+    safe_clip_id = sanitize_id(record.clip_id)
+
+    clip_suffix = Path(record.clip_path).suffix or ".mp4"
+    best_suffix = Path(record.best_frame_path).suffix or ".jpg"
+    exported_clip = export_asset(
+        record.clip_path,
+        group_dir / f"{safe_clip_id}{clip_suffix}",
+        export_mode,
+        f"{safe_clip_id}_clip_path.txt",
+    )
+    exported_best = export_asset(
+        record.best_frame_path,
+        group_dir / f"{safe_clip_id}_best{best_suffix}",
+        export_mode,
+        f"{safe_clip_id}_best_path.txt",
+    )
+
+    metadata = record.to_json()
+    metadata.update({"exported_clip": exported_clip, "exported_best_frame": exported_best})
+    write_json(group_dir / f"{safe_clip_id}.json", metadata)
+    return str(group_dir.resolve()).replace("\\", "/")
+
+
 def crop_person(frame: np.ndarray, box: Iterable[int], expand_ratio: float = 0.08) -> np.ndarray | None:
     height, width = frame.shape[:2]
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -393,9 +456,14 @@ class GalleryRecord:
     duration_seconds: float
     frame_count: int
     embedding_method: str
+    similarity_group_id: int = 0
+    similarity_group_label: str = ""
+    similarity_group_score: float = 0.0
+    similarity_group_count: int = 0
+    similarity_group_export_dir: str = ""
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "clip_id": self.clip_id,
             "clip_path": self.clip_path,
             "best_frame_path": self.best_frame_path,
@@ -409,6 +477,17 @@ class GalleryRecord:
             "frame_count": int(self.frame_count),
             "embedding_method": self.embedding_method,
         }
+        if self.similarity_group_label:
+            payload.update(
+                {
+                    "similarity_group_id": int(self.similarity_group_id),
+                    "similarity_group_label": self.similarity_group_label,
+                    "similarity_group_score": round(float(self.similarity_group_score), 6),
+                    "similarity_group_count": int(self.similarity_group_count),
+                    "similarity_group_export_dir": self.similarity_group_export_dir,
+                }
+            )
+        return payload
 
 
 class LiveTopKGallery:
@@ -416,6 +495,7 @@ class LiveTopKGallery:
         self.lock = threading.Lock()
         self.records: list[GalleryRecord] = []
         self.seen_clip_ids: set[str] = set()
+        self.similarity_groups: list[dict[str, object]] = []
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.gallery_log_path = self.log_dir / "gallery_events.jsonl"
@@ -433,6 +513,45 @@ class LiveTopKGallery:
             self.seen_clip_ids.add(record.clip_id)
         self._append_jsonl(self.gallery_log_path, record.to_json())
         return True
+
+    def assign_similarity_group(self, record: GalleryRecord, threshold: float) -> dict[str, object]:
+        embedding = normalize_vector(record.embedding)
+        if embedding is None:
+            return {"group_id": 0, "group_label": "", "score": 0.0, "count": 0}
+
+        with self.lock:
+            best_group = None
+            best_score = -1.0
+            for group in self.similarity_groups:
+                centroid = np.asarray(group["centroid"], dtype=np.float32)
+                score = float(np.dot(embedding, centroid))
+                if score > best_score:
+                    best_score = score
+                    best_group = group
+
+            if best_group is None or best_score < float(threshold):
+                group_id = len(self.similarity_groups) + 1
+                best_group = {
+                    "group_id": group_id,
+                    "group_label": f"group_{group_id:03d}",
+                    "centroid": embedding,
+                    "count": 0,
+                }
+                self.similarity_groups.append(best_group)
+                best_score = 1.0
+
+            count = int(best_group["count"]) + 1
+            centroid = np.asarray(best_group["centroid"], dtype=np.float32)
+            updated_centroid = normalize_vector((centroid * float(best_group["count"])) + embedding)
+            best_group["centroid"] = embedding if updated_centroid is None else updated_centroid
+            best_group["count"] = count
+
+            return {
+                "group_id": int(best_group["group_id"]),
+                "group_label": str(best_group["group_label"]),
+                "score": float(best_score),
+                "count": count,
+            }
 
     def rank(self, query_embedding: np.ndarray | None, k: int, candidate_pool: int, fallback_score: float):
         query = normalize_vector(query_embedding)
@@ -936,6 +1055,19 @@ class LiveTopKCameraWorker(threading.Thread):
         record = recorder.close(self.embedder, reason)
         if record is None:
             return
+        if self.args.storage_layout == "similarity":
+            group = self.gallery.assign_similarity_group(record, float(self.args.similarity_group_threshold))
+            record.similarity_group_id = int(group["group_id"])
+            record.similarity_group_label = str(group["group_label"])
+            record.similarity_group_score = float(group["score"])
+            record.similarity_group_count = int(group["count"])
+            if int(record.frame_count) >= max(0, int(self.args.similarity_min_frames)):
+                record.similarity_group_export_dir = export_similarity_group_record(
+                    record,
+                    self.snapshot_root,
+                    self.session_id,
+                    str(self.args.similarity_export_mode),
+                )
         added = self.gallery.add_record(record)
         if not added:
             return
@@ -955,6 +1087,11 @@ class LiveTopKCameraWorker(threading.Thread):
         print(
             f"[gallery] Added {record.clip_id} cam={record.cam_id} label={record.cam_label} "
             f"quality={record.quality:.3f} frames={record.frame_count}"
+            + (
+                f" group={record.similarity_group_label} group_score={record.similarity_group_score:.3f}"
+                if record.similarity_group_label
+                else ""
+            )
         )
 
     def _close_all_recorders(self, reason: str) -> None:
@@ -984,6 +1121,11 @@ def main() -> int:
     print(f"Session: {session_id}")
     print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
+    print(
+        f"Storage layout: {args.storage_layout} "
+        f"similarity_threshold={args.similarity_group_threshold} "
+        f"similarity_export_mode={args.similarity_export_mode}"
+    )
     if args.export_topk_dir:
         print(f"Top-K export root: {resolve_project_path(args.export_topk_dir)} mode={args.export_mode}")
     print(f"Log dir: {log_dir}")

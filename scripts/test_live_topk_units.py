@@ -21,6 +21,7 @@ from live_topk_bridge import (  # noqa: E402
     LiveTopKGallery,
     build_topk_payload,
     export_asset,
+    export_similarity_group_record,
     normalize_cam_type,
     normalize_vector,
     split_cam_labels,
@@ -68,6 +69,23 @@ def test_gallery_ranking() -> None:
         assert [item["clip_id"] for item in results] == ["match", "miss"]
         assert results[0]["score"] > results[1]["score"]
         assert results[1]["fallback"] is True
+
+
+def test_similarity_grouping() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        gallery = LiveTopKGallery(Path(tmp_dir))
+        first = make_record("first", [1.0, 0.0, 0.0])
+        second = make_record("second", [0.95, 0.05, 0.0])
+        third = make_record("third", [0.0, 1.0, 0.0])
+
+        group_a = gallery.assign_similarity_group(first, threshold=0.8)
+        group_b = gallery.assign_similarity_group(second, threshold=0.8)
+        group_c = gallery.assign_similarity_group(third, threshold=0.8)
+
+        assert group_a["group_label"] == "group_001"
+        assert group_b["group_label"] == "group_001"
+        assert group_b["count"] == 2
+        assert group_c["group_label"] == "group_002"
 
 
 def test_topk_payload_shape() -> None:
@@ -128,11 +146,39 @@ def test_export_helpers() -> None:
     shutil.rmtree(test_root, ignore_errors=True)
 
 
+def test_similarity_group_export() -> None:
+    test_root = PROJECT_ROOT / "logs" / "test_similarity_group_export"
+    shutil.rmtree(test_root, ignore_errors=True)
+    source_dir = test_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    clip_path = source_dir / "clip.mp4"
+    clip_path.write_bytes(b"unit-clip")
+    best_path = source_dir / "best.jpg"
+    cv2.imwrite(str(best_path), np.zeros((8, 8, 3), dtype=np.uint8))
+
+    record = make_record("clip", [1.0, 0.0, 0.0])
+    record.clip_path = str(clip_path)
+    record.best_frame_path = str(best_path)
+    record.similarity_group_id = 1
+    record.similarity_group_label = "group_001"
+    record.similarity_group_score = 1.0
+    record.similarity_group_count = 1
+
+    group_dir = export_similarity_group_record(record, test_root, "session", "symlink")
+    assert Path(group_dir).name == "group_001"
+    assert (Path(group_dir) / "clip.mp4").exists()
+    assert (Path(group_dir) / "clip_best.jpg").exists()
+    assert (Path(group_dir) / "clip.json").exists()
+    shutil.rmtree(test_root, ignore_errors=True)
+
+
 def main() -> int:
     test_source_parsing()
     test_gallery_ranking()
+    test_similarity_grouping()
     test_topk_payload_shape()
     test_export_helpers()
+    test_similarity_group_export()
     print("LIVE_TOPK_UNIT_OK")
     return 0
 

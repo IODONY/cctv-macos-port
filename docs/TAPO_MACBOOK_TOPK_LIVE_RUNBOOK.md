@@ -70,9 +70,19 @@ python src/live_topk_bridge.py \
   --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL \
   --cam-types G,G,G \
   --cam-labels tapo_1,tapo_2,tapo_3 \
+  --storage-layout similarity \
   --max-runtime-seconds 120 \
   --disable-osc
 ```
+
+With `--storage-layout similarity`, the original camera folders are still kept for traceability, but a review view is also created at:
+
+```text
+snapshots/live_topk/<session>/similarity_groups/group_001/
+snapshots/live_topk/<session>/similarity_groups/group_002/
+```
+
+Each group folder contains symlinks to clips and best crops that the visual embedding currently considers similar. This is a temporary debugging view, not a confirmed identity label. Tune `--similarity-group-threshold` up when different people are merging too easily, or down when the same person is split across many groups.
 
 Finally run three Tapo gallery cameras plus the MacBook query camera. This test does not require TouchDesigner; every query event exports the selected clips into the workspace.
 
@@ -108,6 +118,7 @@ Generated runtime files stay under ignored folders:
 
 - `snapshots/live_topk/<session>/cam_N/*.mp4`: cropped per-person track clips.
 - `snapshots/live_topk/<session>/cam_N/*_best.jpg`: best ReID crop per track.
+- `snapshots/live_topk/<session>/similarity_groups/group_NNN/`: optional appearance-similarity review folders when `--storage-layout similarity` is used.
 - `snapshots/topk_exports/<session>/<query_id>/results.json`: ranked clips selected for one MacBook query event.
 - `snapshots/topk_exports/<session>/<query_id>/query_best.jpg`: query crop used for ranking.
 - `snapshots/topk_exports/<session>/<query_id>/rank_01/clip.mp4`: symlink or copy of the selected clip, depending on `--export-mode`.
@@ -161,6 +172,8 @@ Important CLI parameters:
 - `--clip-width 320 --clip-height 640`: cropped person clip resolution.
 - `--fallback-score 0.55`: score below which a result is considered fallback.
 - `--cam-labels ...`: physical camera labels that stay attached to logs, exports, and OSC side channels.
+- `--storage-layout similarity`: mirror gallery clips into appearance-similarity folders for debugging.
+- `--similarity-group-threshold 0.72`: grouping threshold for that temporary review layout.
 - `--export-topk-dir snapshots/topk_exports`: query-by-query export bundles for TouchDesigner-free testing.
 - `--disable-osc`: skip all OSC traffic during camera-only validation.
 

@@ -20,8 +20,8 @@ from evaluate_labeled_clips import (
 )
 from walnut_core import WalnutAnalyzer
 from visual_reid import (
-    TorchvisionEmbedder,
     analyze_clip_visual,
+    create_visual_embedder,
     serializable_visual_analysis,
 )
 
@@ -736,7 +736,7 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
     visual_cache = {}
     if backend in {"visual", "hybrid"}:
         visual_analyzer = WalnutAnalyzer(vote_frame_window=args.visual_vote_frame_window)
-        embedder = TorchvisionEmbedder(
+        embedder = create_visual_embedder(
             model_name=args.embedding_model,
             color_weight=args.visual_color_weight,
         )
@@ -1152,8 +1152,8 @@ def main() -> int:
     parser.add_argument("--retrieval-backend", choices=("profile", "visual", "hybrid"), default="profile")
     parser.add_argument(
         "--embedding-model",
-        choices=("mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
-        default="mobilenet_v3_large",
+        choices=("osnet_x0_25", "mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
+        default="osnet_x0_25",
     )
     parser.add_argument("--visual-top-n", type=int, default=1)
     parser.add_argument("--visual-vote-frame-window", type=int, default=20)

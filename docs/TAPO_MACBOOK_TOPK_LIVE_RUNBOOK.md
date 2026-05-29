@@ -70,6 +70,7 @@ python src/live_topk_bridge.py \
   --rtsp-envs TAPO_CAM_1_RTSP_URL,TAPO_CAM_2_RTSP_URL,TAPO_CAM_3_RTSP_URL \
   --cam-types G,G,G \
   --cam-labels tapo_1,tapo_2,tapo_3 \
+  --embedding-model osnet_x0_25 \
   --record-video-mode full-frame \
   --storage-layout similarity \
   --show-preview \
@@ -86,6 +87,17 @@ snapshots/live_topk/<session>/similarity_groups/group_002/
 ```
 
 Each group folder contains symlinks to clips and best crops that the visual embedding currently considers similar. This is a temporary debugging view, not a confirmed identity label. Tune `--similarity-group-threshold` up when different people are merging too easily, or down when the same person is split across many groups.
+
+To re-check grouping quality from an existing live session without opening the cameras again:
+
+```bash
+source .venv/bin/activate
+python scripts/sweep_live_similarity_groups.py \
+  --session <session_id> \
+  --embedding-model osnet_x0_25 \
+  --thresholds 0.50,0.55,0.60,0.65,0.70,0.72 \
+  --output-report docs/reports/LIVE_OSNET_GROUPING_SWEEP_REPORT.md
+```
 
 Finally run three Tapo gallery cameras plus the MacBook query camera. This test does not require TouchDesigner; every query event exports the selected clips into the workspace.
 
@@ -161,7 +173,9 @@ Unlike the older Type-C playback callback, routing is by Top-K rank, not by came
 
 ## ReID Behavior
 
-The default embedding path uses `torchvision_mobilenet_v3_large` with a project-local model cache. If that model cannot load, the bridge falls back to an HSV color histogram so the runtime stays alive.
+The default embedding path uses Torchreid `osnet_x0_25` with MSMT17 ReID weights cached under `logs/model_cache/torchreid`. This is a person-ReID appearance model, not face recognition. If `torchreid` or the OSNet weights cannot load, the bridge raises an explicit error instead of silently falling back to MobileNetV3.
+
+MobileNetV3 and HSV histogram backends remain available for comparison with `--embedding-model mobilenet_v3_large`, `mobilenet_v3_small`, `efficientnet_b0`, or `hsv_histogram`.
 
 The ranking score is cosine similarity between normalized query and gallery embeddings. Results below `--fallback-score` are still returned to keep the display populated, but they are marked as fallback in logs and OSC payloads.
 
@@ -175,6 +189,7 @@ Important CLI parameters:
 - `--clip-width 320 --clip-height 640`: cropped person clip resolution.
 - `--fallback-score 0.55`: score below which a result is considered fallback.
 - `--cam-labels ...`: physical camera labels that stay attached to logs, exports, and OSC side channels.
+- `--embedding-model osnet_x0_25`: default lightweight person-ReID backend.
 - `--record-video-mode full-frame`: save full-frame video per detected person track while keeping ReID crops separate.
 - `--record-video-mode person-crop`: legacy mode that records cropped person videos.
 - `--show-preview`: open annotated YOLO/ReID analysis windows.

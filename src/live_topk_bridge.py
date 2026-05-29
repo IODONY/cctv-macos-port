@@ -31,7 +31,7 @@ import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
 
 from visual_reid import (
-    TorchvisionEmbedder,
+    create_visual_embedder,
     crop_person as visual_crop_person,
     crop_quality as visual_crop_quality,
     resize_with_padding as visual_resize_with_padding,
@@ -141,6 +141,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=9)
     parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument(
+        "--embedding-model",
+        choices=("osnet_x0_25", "mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
+        default="osnet_x0_25",
+        help="Appearance embedding backend for ReID ranking and similarity grouping.",
+    )
     parser.add_argument(
         "--skip-webcam-preflight",
         action="store_true",
@@ -542,13 +548,24 @@ def crop_quality(crop: np.ndarray | None, person: dict[str, object]) -> float:
     return (confidence * 0.45) + (sharpness * 0.30) + (area_score * 0.25)
 
 
-class AppearanceEmbedder(TorchvisionEmbedder):
-    def __init__(self, cache_root: Path = MODEL_CACHE_ROOT):
-        super().__init__(
-            model_name="mobilenet_v3_large",
+class AppearanceEmbedder:
+    def __init__(self, model_name: str = "osnet_x0_25", cache_root: Path | None = None):
+        self.delegate = create_visual_embedder(
+            model_name=model_name,
             cache_root=cache_root,
             color_weight=0.20,
         )
+
+    @property
+    def method(self) -> str:
+        return str(getattr(self.delegate, "method", "unknown"))
+
+    @property
+    def device(self) -> str:
+        return str(getattr(self.delegate, "device", "unknown"))
+
+    def embed_bgr(self, image_bgr: np.ndarray | None) -> tuple[np.ndarray | None, str]:
+        return self.delegate.embed_bgr(image_bgr)
 
 
 @dataclass
@@ -1264,7 +1281,7 @@ def main() -> int:
     log_dir = PROJECT_ROOT / "logs" / "topk_live" / session_id
 
     gallery = LiveTopKGallery(log_dir)
-    embedder = AppearanceEmbedder(MODEL_CACHE_ROOT)
+    embedder = AppearanceEmbedder(model_name=args.embedding_model)
     osc = OscSender(args.osc_host, args.osc_port, args.osc_dry_run, args.disable_osc)
     stop_event = threading.Event()
 
@@ -1273,6 +1290,7 @@ def main() -> int:
     print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
     print(f"Record video mode: {args.record_video_mode}")
+    print(f"Embedding model: {args.embedding_model} method={embedder.method} device={embedder.device}")
     if args.show_preview:
         print("Preview windows: enabled. Press q or Esc in a preview window to stop.")
     print(

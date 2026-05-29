@@ -17,6 +17,8 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_ROOT = PROJECT_ROOT / "logs" / "model_cache" / "torch"
+TORCHREID_CACHE_ROOT = PROJECT_ROOT / "logs" / "model_cache" / "torchreid"
+OSNET_X0_25_MSMT17_FILE_ID = "1Kkx2zW89jq_NETu4u42CFZTMVD5Hwm6e"
 
 
 def normalize_vector(vector: np.ndarray | None) -> np.ndarray | None:
@@ -398,6 +400,125 @@ class TorchvisionEmbedder:
         return normalize_vector(fused)
 
 
+class PersonReIDEmbedder:
+    def __init__(
+        self,
+        model_name: str = "osnet_x0_25",
+        cache_root: Path = TORCHREID_CACHE_ROOT,
+    ):
+        self.model_name = str(model_name or "osnet_x0_25").strip().lower()
+        self.cache_root = cache_root
+        self.checkpoint_dir = self.cache_root / "checkpoints"
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+        self.model = None
+        self.device = "cpu"
+        self.method = f"torchreid_{self.model_name}"
+        self._load_model()
+
+    @property
+    def config_id(self) -> str:
+        return f"{self.model_name}:method={self.method}:checkpoint=msmt17_combineall"
+
+    def _load_model(self) -> None:
+        if self.model_name != "osnet_x0_25":
+            raise ValueError(f"Unsupported person-ReID model: {self.model_name}")
+
+        try:
+            import certifi
+
+            os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+            os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+        except Exception:
+            pass
+
+        os.environ.setdefault("TORCH_HOME", str(self.cache_root))
+        try:
+            import torch
+            import torchreid
+            from torchreid.reid.utils import load_pretrained_weights
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "torchreid person-ReID backend is unavailable. "
+                "Install torchreid, gdown, and tensorboard in the project .venv."
+            ) from exc
+
+        if torch.cuda.is_available():
+            self.device = "cuda:0"
+        elif getattr(getattr(torch, "backends", None), "mps", None) is not None and torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+
+        checkpoint_path = self._ensure_checkpoint()
+        model = torchreid.models.build_model(
+            name=self.model_name,
+            num_classes=1000,
+            loss="softmax",
+            pretrained=False,
+        )
+        load_pretrained_weights(model, str(checkpoint_path))
+        model.eval().to(self.device)
+        self.model = model
+        print(f"[person-reid] Loaded {self.method} on {self.device}; checkpoint={checkpoint_path}")
+
+    def _ensure_checkpoint(self) -> Path:
+        checkpoint_path = self.checkpoint_dir / (
+            "osnet_x0_25_msmt17_combineall_256x128_amsgrad_"
+            "ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip_jitter.pth"
+        )
+        if checkpoint_path.is_file() and checkpoint_path.stat().st_size > 0:
+            return checkpoint_path
+
+        try:
+            import gdown
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("gdown is required to download OSNet x0.25 ReID weights.") from exc
+
+        url = f"https://drive.google.com/uc?id={OSNET_X0_25_MSMT17_FILE_ID}"
+        downloaded = gdown.download(url, str(checkpoint_path), quiet=False)
+        if not downloaded or not checkpoint_path.is_file() or checkpoint_path.stat().st_size <= 0:
+            raise RuntimeError(f"Failed to download OSNet x0.25 ReID weights to {checkpoint_path}")
+        return checkpoint_path
+
+    def embed_bgr(self, image_bgr: np.ndarray | None) -> tuple[np.ndarray | None, str]:
+        if image_bgr is None or image_bgr.size == 0:
+            return None, self.method
+        if self.model is None:
+            raise RuntimeError("PersonReIDEmbedder model is not loaded.")
+        embedding = self._embed_torchreid(image_bgr)
+        return embedding, self.method
+
+    def _embed_torchreid(self, image_bgr: np.ndarray) -> np.ndarray | None:
+        import torch
+
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(image_rgb, (128, 256), interpolation=cv2.INTER_AREA)
+        tensor = torch.from_numpy(resized).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+        mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1)
+        tensor = ((tensor - mean) / std).to(self.device)
+
+        with self.lock, torch.inference_mode():
+            features = self.model(tensor).detach().float().cpu().numpy().reshape(-1)
+        return normalize_vector(features)
+
+
+def create_visual_embedder(
+    model_name: str = "osnet_x0_25",
+    cache_root: Path | None = None,
+    color_weight: float = 0.20,
+):
+    normalized = str(model_name or "osnet_x0_25").strip().lower()
+    if normalized == "osnet_x0_25":
+        return PersonReIDEmbedder(model_name=normalized, cache_root=cache_root or TORCHREID_CACHE_ROOT)
+    return TorchvisionEmbedder(
+        model_name=normalized,
+        cache_root=cache_root or MODEL_CACHE_ROOT,
+        color_weight=color_weight,
+    )
+
+
 def _cache_key(clip_path: Path, params: dict[str, object]) -> str:
     stat = clip_path.stat()
     payload = {
@@ -436,7 +557,7 @@ def _save_cached_analysis(cache_path: Path, metadata: dict[str, object], embeddi
 
 def analyze_clip_visual(
     analyzer,
-    embedder: TorchvisionEmbedder,
+    embedder,
     clip_path: Path,
     clip_id: str,
     max_frames: int,

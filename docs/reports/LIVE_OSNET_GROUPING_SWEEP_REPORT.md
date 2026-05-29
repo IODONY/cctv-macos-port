@@ -8,28 +8,30 @@ This report re-embeds saved live `_best.jpg` crops only. It does not run RTSP, w
 - Records embedded: `18`
 - Embedding model: `osnet_x0_25`
 - Embedding method: `torchreid_osnet_x0_25`
+- Reciprocal top-N: `5`
 
 ## Threshold Sweep
 
-| threshold | connected groups | connected sizes | live-centroid groups | live-centroid sizes |
-| ---: | ---: | --- | ---: | --- |
-| 0.50 | 1 | [18] | 1 | [18] |
-| 0.55 | 1 | [18] | 5 | [7, 7, 2, 1, 1] |
-| 0.60 | 4 | [12, 4, 1, 1] | 6 | [8, 4, 2, 2, 1, 1] |
-| 0.65 | 8 | [7, 4, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] |
-| 0.70 | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] |
-| 0.72 | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 10 | [4, 4, 2, 2, 1, 1, 1, 1, 1, 1] |
+| threshold | connected groups | connected sizes | reciprocal groups | reciprocal sizes | centroid groups | centroid sizes |
+| ---: | ---: | --- | ---: | --- | ---: | --- |
+| 0.50 | 1 | [18] | 2 | [16, 2] | 1 | [18] |
+| 0.55 | 1 | [18] | 2 | [16, 2] | 5 | [7, 7, 2, 1, 1] |
+| 0.60 | 4 | [12, 4, 1, 1] | 5 | [10, 4, 2, 1, 1] | 6 | [8, 4, 2, 2, 1, 1] |
+| 0.65 | 8 | [7, 4, 2, 1, 1, 1, 1, 1] | 8 | [7, 4, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] |
+| 0.70 | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] |
+| 0.72 | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 9 | [5, 4, 2, 2, 1, 1, 1, 1, 1] | 10 | [4, 4, 2, 2, 1, 1, 1, 1, 1, 1] |
 
 ## Pairwise Similarity
 
-- Min: `0.3319`
-- Mean: `0.5299`
-- Median: `0.5115`
-- Max: `0.8799`
+- Count: `153`
+- Min: `0.331876`
+- Mean: `0.529863`
+- Median: `0.511509`
+- Max: `0.879869`
 
 ## Interpretation
 
 - For a single-person smoke session, a lower group count is desirable.
-- The connected grouping column shows whether the embedding space links the saved crops together.
-- The live-centroid column approximates the current online export grouping logic.
-- If different visitors merge in future tests, raise `--similarity-group-threshold`; if the same visitor splits, lower it or add session-end merge.
+- `connected` shows whether saved crops are linked by any threshold path.
+- `reciprocal` is the intended final session-end grouping mode.
+- `centroid` approximates the online temporary grouping behavior.

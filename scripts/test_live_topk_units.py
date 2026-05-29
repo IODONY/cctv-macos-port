@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sys
 import tempfile
@@ -29,6 +30,8 @@ from live_topk_bridge import (  # noqa: E402
     split_sources,
     write_json,
 )
+from live_session_grouping import regroup_live_session  # noqa: E402
+from visual_grouping import VisualGroupRecord, group_records, reciprocal_groups  # noqa: E402
 
 
 def make_record(clip_id: str, vector: list[float]) -> GalleryRecord:
@@ -86,6 +89,30 @@ def test_similarity_grouping() -> None:
         assert group_b["group_label"] == "group_001"
         assert group_b["count"] == 2
         assert group_c["group_label"] == "group_002"
+
+
+def test_visual_grouping_connected_chain() -> None:
+    records = [
+        VisualGroupRecord("a", "/tmp/a.mp4", "/tmp/a.jpg", np.asarray([1.0, 0.0], dtype=np.float32)),
+        VisualGroupRecord("b", "/tmp/b.mp4", "/tmp/b.jpg", np.asarray([0.8, 0.6], dtype=np.float32)),
+        VisualGroupRecord("c", "/tmp/c.mp4", "/tmp/c.jpg", np.asarray([0.28, 0.96], dtype=np.float32)),
+    ]
+    report = group_records(records, method="connected", threshold=0.75)
+    assert report["group_count"] == 1
+    assert report["group_sizes"] == [3]
+
+
+def test_visual_grouping_reciprocal_filter() -> None:
+    scores = np.asarray(
+        [
+            [1.0, 0.7, 0.9],
+            [0.7, 1.0, 0.1],
+            [0.9, 0.1, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    groups = reciprocal_groups(scores, threshold=0.65, reciprocal_topn=1)
+    assert groups == [[0, 2], [1]]
 
 
 def test_topk_payload_shape() -> None:
@@ -172,13 +199,67 @@ def test_similarity_group_export() -> None:
     shutil.rmtree(test_root, ignore_errors=True)
 
 
+def test_regroup_live_session_export() -> None:
+    session_id = "unit_regroup"
+    log_root = PROJECT_ROOT / "logs" / "topk_live" / session_id
+    test_root = PROJECT_ROOT / "logs" / "test_regroup_live_session"
+    shutil.rmtree(log_root, ignore_errors=True)
+    shutil.rmtree(test_root, ignore_errors=True)
+    source_dir = test_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    for index, color in enumerate(((0, 0, 255), (0, 0, 255), (255, 0, 0)), start=1):
+        clip_id = f"clip_{index}"
+        clip_path = source_dir / f"{clip_id}.mp4"
+        clip_path.write_bytes(b"unit-clip")
+        best_path = source_dir / f"{clip_id}_best.jpg"
+        cv2.imwrite(str(best_path), np.full((32, 32, 3), color, dtype=np.uint8))
+        rows.append(
+            {
+                "clip_id": clip_id,
+                "clip_path": str(clip_path),
+                "best_frame_path": str(best_path),
+                "cam_id": "cam_1",
+                "cam_label": "unit",
+                "event_id": clip_id,
+                "track_id": index,
+            }
+        )
+    log_root.mkdir(parents=True, exist_ok=True)
+    with (log_root / "gallery_events.jsonl").open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+    payload = regroup_live_session(
+        session_id=session_id,
+        embedding_model="hsv_histogram",
+        method="reciprocal",
+        threshold=0.9,
+        reciprocal_topn=2,
+        export_mode="symlink",
+        snapshot_root=test_root / "snapshots",
+        output_subdir="similarity_groups_merged",
+    )
+    assert payload["grouping"]["record_count"] == 3
+    assert payload["grouping"]["group_count"] == 2
+    output_dir = PROJECT_ROOT / payload["output_dir"]
+    assert (output_dir / "group_001" / "group.json").exists()
+    assert (log_root / "merged_similarity_groups.json").exists()
+    shutil.rmtree(log_root, ignore_errors=True)
+    shutil.rmtree(test_root, ignore_errors=True)
+
+
 def main() -> int:
     test_source_parsing()
     test_gallery_ranking()
     test_similarity_grouping()
+    test_visual_grouping_connected_chain()
+    test_visual_grouping_reciprocal_filter()
     test_topk_payload_shape()
     test_export_helpers()
     test_similarity_group_export()
+    test_regroup_live_session_export()
     print("LIVE_TOPK_UNIT_OK")
     return 0
 

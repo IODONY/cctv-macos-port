@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 from pythonosc.udp_client import SimpleUDPClient
 
+from live_session_grouping import regroup_live_session
 from visual_reid import (
     create_visual_embedder,
     crop_person as visual_crop_person,
@@ -126,6 +127,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Minimum recorded frames required before a clip is mirrored into a similarity group folder.",
+    )
+    parser.add_argument(
+        "--no-session-end-merge",
+        action="store_true",
+        help="Skip final session-end regrouping when --storage-layout similarity is active.",
+    )
+    parser.add_argument(
+        "--merge-method",
+        choices=("connected", "reciprocal"),
+        default="reciprocal",
+        help="Final session-end grouping method for similarity_groups_merged.",
+    )
+    parser.add_argument(
+        "--merge-threshold",
+        type=float,
+        default=0.55,
+        help="Cosine threshold for final session-end merged similarity groups.",
+    )
+    parser.add_argument(
+        "--merge-reciprocal-topn",
+        type=int,
+        default=5,
+        help="Mutual top-N neighborhood size for reciprocal final grouping.",
+    )
+    parser.add_argument(
+        "--merge-output-subdir",
+        default="similarity_groups_merged",
+        help="Subdirectory under snapshots/live_topk/<session> for final merged groups.",
     )
     parser.add_argument("--clip-width", type=int, default=320)
     parser.add_argument("--clip-height", type=int, default=640)
@@ -1296,7 +1325,8 @@ def main() -> int:
     print(
         f"Storage layout: {args.storage_layout} "
         f"similarity_threshold={args.similarity_group_threshold} "
-        f"similarity_export_mode={args.similarity_export_mode}"
+        f"similarity_export_mode={args.similarity_export_mode} "
+        f"session_end_merge={not args.no_session_end_merge}"
     )
     if args.export_topk_dir:
         print(f"Top-K export root: {resolve_project_path(args.export_topk_dir)} mode={args.export_mode}")
@@ -1339,6 +1369,27 @@ def main() -> int:
         if args.show_preview:
             with PREVIEW_LOCK:
                 cv2.destroyAllWindows()
+        if args.storage_layout == "similarity" and not args.no_session_end_merge and gallery.count() > 0:
+            try:
+                merge_payload = regroup_live_session(
+                    session_id=session_id,
+                    embedding_model=args.embedding_model,
+                    method=args.merge_method,
+                    threshold=float(args.merge_threshold),
+                    reciprocal_topn=int(args.merge_reciprocal_topn),
+                    export_mode=str(args.similarity_export_mode),
+                    snapshot_root=resolve_project_path(args.snapshot_dir),
+                    output_subdir=str(args.merge_output_subdir),
+                    write_report=log_dir / "merged_similarity_groups_report.md",
+                )
+                grouping = merge_payload["grouping"]
+                print(
+                    "[merge] Session-end regroup complete "
+                    f"groups={grouping['group_count']} sizes={grouping['group_sizes']} "
+                    f"output={merge_payload['output_dir']}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[merge] Session-end regroup failed: {exc!r}")
 
     print(f"Stopped. Gallery records: {gallery.count()}")
     return 0

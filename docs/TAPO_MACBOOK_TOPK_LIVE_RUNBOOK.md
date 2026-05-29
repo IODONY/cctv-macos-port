@@ -84,14 +84,24 @@ With `--storage-layout similarity`, the original camera folders are still kept f
 ```text
 snapshots/live_topk/<session>/similarity_groups/group_001/
 snapshots/live_topk/<session>/similarity_groups/group_002/
+snapshots/live_topk/<session>/similarity_groups_merged/group_001/
 ```
 
-Each group folder contains symlinks to clips and best crops that the visual embedding currently considers similar. This is a temporary debugging view, not a confirmed identity label. Tune `--similarity-group-threshold` up when different people are merging too easily, or down when the same person is split across many groups.
+`similarity_groups/` is the online temporary view created as clips finish. `similarity_groups_merged/` is regenerated at session shutdown using all saved clips and reciprocal kNN grouping, so it is the preferred review folder when checking whether the same person was split too much.
 
 To re-check grouping quality from an existing live session without opening the cameras again:
 
 ```bash
 source .venv/bin/activate
+python scripts/regroup_live_session.py \
+  --session <session_id> \
+  --embedding-model osnet_x0_25 \
+  --method reciprocal \
+  --threshold 0.55 \
+  --reciprocal-topn 5 \
+  --export-mode symlink \
+  --write-report docs/reports/LIVE_SESSION_REGROUP_REPORT.md
+
 python scripts/sweep_live_similarity_groups.py \
   --session <session_id> \
   --embedding-model osnet_x0_25 \
@@ -134,6 +144,7 @@ Generated runtime files stay under ignored folders:
 - `snapshots/live_topk/<session>/cam_N/*.mp4`: per-person track clips. With the default `--record-video-mode full-frame`, these are full original frames, not cropped person videos.
 - `snapshots/live_topk/<session>/cam_N/*_best.jpg`: cropped best ReID frame per track.
 - `snapshots/live_topk/<session>/similarity_groups/group_NNN/`: optional appearance-similarity review folders when `--storage-layout similarity` is used.
+- `snapshots/live_topk/<session>/similarity_groups_merged/group_NNN/`: final session-end regrouped review folders.
 - `snapshots/topk_exports/<session>/<query_id>/results.json`: ranked clips selected for one MacBook query event.
 - `snapshots/topk_exports/<session>/<query_id>/query_best.jpg`: query crop used for ranking.
 - `snapshots/topk_exports/<session>/<query_id>/rank_01/clip.mp4`: symlink or copy of the selected clip, depending on `--export-mode`.
@@ -196,6 +207,9 @@ Important CLI parameters:
 - `--preview-reid-crops`: also show the selected ReID crop whenever a track is embedded.
 - `--storage-layout similarity`: mirror gallery clips into appearance-similarity folders for debugging.
 - `--similarity-group-threshold 0.72`: grouping threshold for that temporary review layout.
+- `--merge-threshold 0.55`: final session-end grouping threshold.
+- `--merge-reciprocal-topn 5`: mutual neighbor count for final session-end grouping.
+- `--no-session-end-merge`: keep only the online temporary similarity folders.
 - `--export-topk-dir snapshots/topk_exports`: query-by-query export bundles for TouchDesigner-free testing.
 - `--disable-osc`: skip all OSC traffic during camera-only validation.
 

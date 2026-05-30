@@ -403,6 +403,13 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
         handle.write("\n")
 
 
+def compact_event_token(event_id: object, digits: int = 6) -> str:
+    text = re.sub(r"\D+", "", str(event_id))
+    if not text:
+        return "e000000"
+    return f"e{text[-max(1, int(digits)):]}"
+
+
 def export_asset(source_path: str, destination: Path, mode: str, path_txt_name: str) -> str:
     if not str(source_path or "").strip():
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -822,7 +829,8 @@ class PersonClipRecorder:
         safe_session = sanitize_id(session_id)
         safe_cam = f"cam_{cam_id}"
         safe_cam_label = sanitize_id(cam_label) or safe_cam
-        clip_id = f"live_{safe_session}_{safe_cam_label}_track_{track_id}_event_{event_id}"
+        event_token = compact_event_token(event_id)
+        clip_id = f"live_{safe_session}_{safe_cam_label}_t{int(track_id):03d}_{event_token}"
         clip_dir = snapshot_root / safe_session / safe_cam_label
         self.clip_id = clip_id
         self.event_id = event_id

@@ -239,6 +239,8 @@ def test_person_clip_recorder_topn_embedding() -> None:
     )
     assert record is not None
     assert record.cam_label == "tapo_1"
+    assert "_event_" not in record.clip_id
+    assert "_t007_e" in record.clip_id
     assert record.tracker_backend == "botsort"
     assert record.embedding_aggregation == "mean_top_3"
     assert len(record.top_crop_paths or []) == 3

@@ -43,6 +43,8 @@ data/test_images/
 .env.*
 *.local
 !tapo-onvif/.env.example
+config/cameras/cameras.local.csv
+config/cameras/*.secret.csv
 tapo-onvif/wb_profiles.json
 *.tmp
 

@@ -63,12 +63,21 @@ def clip_id_from_asset(path: Path) -> str:
     return stem
 
 
-def load_truth_assignments(root: Path, duplicate_policy: str) -> dict[str, object]:
+def parse_label_prefixes(value: str) -> list[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def load_truth_assignments(root: Path, duplicate_policy: str, label_prefixes: list[str] | None = None) -> dict[str, object]:
     raw: dict[str, list[str]] = defaultdict(list)
     files_by_clip: dict[str, list[str]] = defaultdict(list)
     labels: dict[str, list[str]] = defaultdict(list)
 
-    for label_dir in sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")):
+    prefixes = [prefix.lower() for prefix in (label_prefixes or [])]
+    candidate_dirs = sorted(path for path in root.iterdir() if path.is_dir() and not path.name.startswith("."))
+    if prefixes:
+        candidate_dirs = [path for path in candidate_dirs if any(path.name.lower().startswith(prefix) for prefix in prefixes)]
+
+    for label_dir in candidate_dirs:
         label = label_dir.name
         for path in sorted(label_dir.iterdir()):
             if path.name.startswith(".") or path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".mp4"}:
@@ -105,6 +114,7 @@ def load_truth_assignments(root: Path, duplicate_policy: str) -> dict[str, objec
     return {
         "truth_root": project_relative(root),
         "duplicate_policy": duplicate_policy,
+        "label_prefixes": label_prefixes or [],
         "raw_label_count": len(labels),
         "raw_labels": {label: sorted(items) for label, items in sorted(labels.items())},
         "conflicts": conflicts,
@@ -574,6 +584,11 @@ def main() -> int:
     )
     parser.add_argument("--duplicate-policy", choices=("exclude", "first", "last"), default="exclude")
     parser.add_argument(
+        "--truth-label-prefixes",
+        default="p",
+        help="Comma-separated truth directory prefixes to include. Default keeps p1/p2/p3 and ignores auto group_* dirs.",
+    )
+    parser.add_argument(
         "--embedding-source",
         choices=("best-crops", "top-crops", "full-mp4", "full-mp4-anchored"),
         default="best-crops",
@@ -605,7 +620,11 @@ def main() -> int:
     truth_root_arg = args.truth_root or f"snapshots/live_topk/{session_id}/similarity_groups_merged/group_001/jpg"
     truth_root = resolve_project_path(truth_root_arg)
     rows = read_jsonl(events_path)
-    truth_payload = load_truth_assignments(truth_root, args.duplicate_policy)
+    truth_payload = load_truth_assignments(
+        truth_root,
+        args.duplicate_policy,
+        parse_label_prefixes(args.truth_label_prefixes),
+    )
     truth_assignments = dict(truth_payload["assignments"])
 
     embedder = create_visual_embedder(model_name=args.embedding_model, color_weight=args.visual_color_weight)

@@ -153,13 +153,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-threshold",
         type=float,
-        default=0.60,
+        default=0.65,
         help="Cosine threshold for final session-end merged similarity groups.",
     )
     parser.add_argument(
         "--merge-reciprocal-topn",
         type=int,
-        default=3,
+        default=8,
         help="Mutual top-N neighborhood size for reciprocal final grouping.",
     )
     parser.add_argument(

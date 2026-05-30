@@ -85,6 +85,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-height", type=int, default=720)
     parser.add_argument("--inference-interval", type=int, default=2)
     parser.add_argument("--print-interval-frames", type=int, default=60)
+    parser.add_argument(
+        "--tracker-backend",
+        choices=("custom", "botsort", "bytetrack"),
+        default="botsort",
+        help="Person tracker backend. botsort is the default for 9-camera live operation.",
+    )
+    parser.add_argument(
+        "--tracker-config-path",
+        default="",
+        help="Optional project-local Ultralytics tracker YAML. Empty uses the backend default.",
+    )
     parser.add_argument("--snapshot-dir", default="snapshots/live_topk")
     parser.add_argument(
         "--record-video-mode",
@@ -160,6 +171,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-height", type=int, default=640)
     parser.add_argument("--track-missing-grace", type=int, default=8)
     parser.add_argument(
+        "--post-roll-seconds",
+        type=float,
+        default=2.0,
+        help="Keep writing a gallery clip this long after the tracker stops seeing the person.",
+    )
+    parser.add_argument(
+        "--min-clip-seconds",
+        type=float,
+        default=1.5,
+        help="Closed gallery clips shorter than this are kept on disk but not added to the ReID gallery.",
+    )
+    parser.add_argument(
         "--max-clip-seconds",
         type=float,
         default=30.0,
@@ -168,8 +191,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--max-read-failures", type=int, default=10)
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--topk", type=int, default=9)
+    parser.add_argument("--topk", type=int, default=7)
     parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument(
+        "--live-visual-top-n",
+        type=int,
+        default=3,
+        help="Number of best live person crops to average into a gallery tracklet embedding.",
+    )
     parser.add_argument(
         "--embedding-model",
         choices=("osnet_x0_25", "mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
@@ -612,6 +641,13 @@ class GalleryRecord:
     duration_seconds: float
     frame_count: int
     embedding_method: str
+    embedding_aggregation: str = "single_best"
+    tracker_backend: str = "custom"
+    source_fps: float = 0.0
+    analyzed_fps: float = 0.0
+    dropped_frame_count: int = 0
+    post_roll_seconds: float = 0.0
+    top_crop_paths: list[str] | None = None
     similarity_group_id: int = 0
     similarity_group_label: str = ""
     similarity_group_score: float = 0.0
@@ -632,7 +668,15 @@ class GalleryRecord:
             "duration_seconds": round(float(self.duration_seconds), 3),
             "frame_count": int(self.frame_count),
             "embedding_method": self.embedding_method,
+            "embedding_aggregation": self.embedding_aggregation,
+            "tracker_backend": self.tracker_backend,
+            "source_fps": round(float(self.source_fps), 3),
+            "analyzed_fps": round(float(self.analyzed_fps), 3),
+            "dropped_frame_count": int(self.dropped_frame_count),
+            "post_roll_seconds": round(float(self.post_roll_seconds), 3),
         }
+        if self.top_crop_paths:
+            payload["top_crop_paths"] = list(self.top_crop_paths)
         if self.similarity_group_label:
             payload.update(
                 {
@@ -655,7 +699,8 @@ class LiveTopKGallery:
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.gallery_log_path = self.log_dir / "gallery_events.jsonl"
-        self.query_log_path = self.log_dir / "query_results.jsonl"
+        self.query_log_path = self.log_dir / "query_events.jsonl"
+        self.legacy_query_log_path = self.log_dir / "query_results.jsonl"
 
     def add_record(self, record: GalleryRecord) -> bool:
         embedding = normalize_vector(record.embedding)
@@ -740,12 +785,14 @@ class LiveTopKGallery:
                     "track_id": record.track_id,
                     "fallback": bool(score < fallback_score),
                     "quality": record.quality,
+                    "embedding_aggregation": record.embedding_aggregation,
                 }
             )
         return results[:k]
 
     def log_query(self, payload: dict[str, object]) -> None:
         self._append_jsonl(self.query_log_path, payload)
+        self._append_jsonl(self.legacy_query_log_path, payload)
 
     def count(self) -> int:
         with self.lock:
@@ -769,45 +816,78 @@ class PersonClipRecorder:
         output_size: tuple[int, int],
         fps: float,
         record_video_mode: str,
+        top_n: int = 1,
     ):
         event_id = str(int(time.time() * 1000))
         safe_session = sanitize_id(session_id)
         safe_cam = f"cam_{cam_id}"
-        clip_id = f"live_{safe_session}_{safe_cam}_track_{track_id}_event_{event_id}"
-        clip_dir = snapshot_root / safe_session / safe_cam
+        safe_cam_label = sanitize_id(cam_label) or safe_cam
+        clip_id = f"live_{safe_session}_{safe_cam_label}_track_{track_id}_event_{event_id}"
+        clip_dir = snapshot_root / safe_session / safe_cam_label
         self.clip_id = clip_id
         self.event_id = event_id
         self.cam_id = safe_cam
-        self.cam_label = sanitize_id(cam_label)
+        self.cam_label = safe_cam_label
         self.track_id = int(track_id)
         self.clip_path = clip_dir / f"{clip_id}.mp4"
         self.best_frame_path = clip_dir / f"{clip_id}_best.jpg"
         self.output_size = output_size
         self.record_video_mode = record_video_mode
+        self.top_n = max(1, int(top_n))
         self.writer, self.codec = create_clip_writer(self.clip_path, fps, output_size)
         self.started_at = time.monotonic()
         self.created_at = time.time()
+        self.last_observed_at = self.started_at
+        self.missing_since: float | None = None
         self.last_box = None
         self.last_person: dict[str, object] | None = None
         self.missing_analyses = 0
         self.frame_count = 0
         self.best_crop = None
         self.best_quality = -1.0
+        self.crop_candidates: list[dict[str, object]] = []
         self.closed = False
         if self.writer is None:
             print(f"[gallery] Failed to open clip writer: {self.clip_path}")
         else:
             print(f"[gallery] Recording track {track_id} with {self.codec}: {self.clip_path}")
 
-    def observe(self, frame: np.ndarray, person: dict[str, object]) -> None:
+    def observe(self, frame: np.ndarray, person: dict[str, object], frame_index: int = 0) -> None:
         self.last_box = tuple(int(value) for value in person["box"])
         self.last_person = person
+        self.last_observed_at = time.monotonic()
+        self.missing_since = None
         self.missing_analyses = 0
         crop = visual_crop_person(frame, self.last_box)
         quality = visual_crop_quality(crop, person, frame.shape)
-        if crop is not None and quality > self.best_quality:
-            self.best_crop = crop
-            self.best_quality = quality
+        if crop is not None:
+            self.crop_candidates.append(
+                {
+                    "crop": crop,
+                    "quality": float(quality),
+                    "frame_index": int(frame_index),
+                    "box": [int(value) for value in self.last_box],
+                    "confidence": float(person.get("confidence", 0.0)),
+                }
+            )
+            self.crop_candidates.sort(key=lambda item: float(item["quality"]), reverse=True)
+            self.crop_candidates = self.crop_candidates[: self.top_n]
+            best = self.crop_candidates[0]
+            self.best_crop = best["crop"]
+            self.best_quality = float(best["quality"])
+
+    def mark_missing(self, now: float | None = None) -> None:
+        self.missing_analyses += 1
+        if self.missing_since is None:
+            self.missing_since = time.monotonic() if now is None else float(now)
+
+    def should_close_after_missing(self, post_roll_seconds: float, track_missing_grace: int) -> bool:
+        if self.missing_since is None:
+            return False
+        now = time.monotonic()
+        if post_roll_seconds >= 0 and (now - self.missing_since) >= float(post_roll_seconds):
+            return True
+        return self.missing_analyses > max(1, int(track_missing_grace))
 
     def write_frame(self, frame: np.ndarray) -> None:
         if self.writer is None or self.last_box is None or self.closed:
@@ -826,7 +906,17 @@ class PersonClipRecorder:
             return False
         return (time.monotonic() - self.started_at) >= max_clip_seconds
 
-    def close(self, embedder: AppearanceEmbedder, reason: str) -> GalleryRecord | None:
+    def close(
+        self,
+        embedder: AppearanceEmbedder,
+        reason: str,
+        min_clip_seconds: float = 0.0,
+        tracker_backend: str = "custom",
+        source_fps: float = 0.0,
+        analyzed_fps: float = 0.0,
+        dropped_frame_count: int = 0,
+        post_roll_seconds: float = 0.0,
+    ) -> GalleryRecord | None:
         if self.closed:
             return None
         self.closed = True
@@ -836,18 +926,46 @@ class PersonClipRecorder:
         if self.writer is not None:
             self.writer.release()
 
+        duration = time.monotonic() - self.started_at
+        if duration < max(0.0, float(min_clip_seconds)):
+            print(
+                f"[gallery] Kept short clip on disk but skipped ReID gallery track {self.track_id}: "
+                f"duration={duration:.2f}s min={float(min_clip_seconds):.2f}s reason={reason}"
+            )
+            return None
+
         if self.best_crop is None:
             print(f"[gallery] Dropped empty track {self.track_id}: {reason}")
             return None
 
         self.best_frame_path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(self.best_frame_path), self.best_crop)
-        embedding, method = embedder.embed_bgr(self.best_crop)
+        top_crop_paths: list[str] = []
+        crop_embeddings = []
+        methods = []
+        for index, candidate in enumerate(self.crop_candidates[: self.top_n], start=1):
+            crop = candidate["crop"]
+            if index == 1:
+                crop_path = self.best_frame_path
+            else:
+                crop_path = self.best_frame_path.with_name(
+                    f"{self.best_frame_path.stem}_crop_{index:03d}{self.best_frame_path.suffix}"
+                )
+            cv2.imwrite(str(crop_path), crop)
+            top_crop_paths.append(str(crop_path.resolve()).replace("\\", "/"))
+            embedding, method = embedder.embed_bgr(crop)
+            if embedding is not None:
+                crop_embeddings.append(embedding)
+                methods.append(method)
+
+        if crop_embeddings:
+            embedding = normalize_vector(np.vstack(crop_embeddings).mean(axis=0))
+            method = methods[-1] if methods else embedder.method
+        else:
+            embedding, method = embedder.embed_bgr(self.best_crop)
         if embedding is None:
             print(f"[gallery] No embedding for track {self.track_id}: {self.clip_path}")
             return None
 
-        duration = time.monotonic() - self.started_at
         return GalleryRecord(
             clip_id=self.clip_id,
             clip_path=str(self.clip_path.resolve()).replace("\\", "/"),
@@ -862,6 +980,13 @@ class PersonClipRecorder:
             duration_seconds=duration,
             frame_count=self.frame_count,
             embedding_method=method,
+            embedding_aggregation=f"mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
+            tracker_backend=str(tracker_backend),
+            source_fps=float(source_fps),
+            analyzed_fps=float(analyzed_fps),
+            dropped_frame_count=int(dropped_frame_count),
+            post_roll_seconds=float(post_roll_seconds),
+            top_crop_paths=top_crop_paths,
         )
 
 
@@ -929,6 +1054,7 @@ def build_topk_payload(
                 "track_id": int(result.get("track_id", 0)),
                 "fallback": bool(result.get("fallback", False)),
                 "quality": round(float(result.get("quality", 0.0)), 4),
+                "embedding_aggregation": str(result.get("embedding_aggregation", "")),
             }
         )
 
@@ -946,7 +1072,7 @@ def build_topk_payload(
     return flat, structured
 
 
-class LiveTopKCameraWorker(threading.Thread):
+class LiveTopKCameraContext:
     def __init__(
         self,
         cam_id: int,
@@ -960,7 +1086,6 @@ class LiveTopKCameraWorker(threading.Thread):
         osc: OscSender,
         stop_event: threading.Event,
     ):
-        super().__init__(daemon=True)
         self.cam_id = int(cam_id)
         self.cam_label = sanitize_id(cam_label)
         self.cam_type = normalize_cam_type(cam_type)
@@ -978,7 +1103,19 @@ class LiveTopKCameraWorker(threading.Thread):
         self.analyzed_frames = 0
         self.read_failures = 0
         self.recorders: dict[int, PersonClipRecorder] = {}
+        self.recorder_lock = threading.Lock()
+        self.frame_lock = threading.Lock()
+        self.latest_frame: np.ndarray | None = None
+        self.latest_frame_index = 0
+        self.latest_captured_at = 0.0
+        self.last_analyzed_source_frame_index = 0
+        self.dropped_frame_count = 0
+        self.source_fps = 0.0
+        self._fps_window_started_at = time.monotonic()
+        self._fps_window_frames = 0
+        self.started_at = time.monotonic()
         self.last_query_sent_at = 0.0
+        tracker_config_path = resolve_project_path(args.tracker_config_path) if args.tracker_config_path else None
 
         self.analyzer = WalnutAnalyzer(
             pose_model_name="yolov8n-pose.pt",
@@ -989,7 +1126,65 @@ class LiveTopKCameraWorker(threading.Thread):
             model_imgsz=640,
             vote_frame_window=20,
             track_max_missing=max(5, int(args.track_missing_grace) + 2),
+            tracker_backend=str(args.tracker_backend),
+            tracker_config_path=tracker_config_path,
         )
+
+    def update_latest_frame(self, frame: np.ndarray, frame_index: int, captured_at: float) -> None:
+        now = time.monotonic()
+        with self.frame_lock:
+            if self.latest_frame is not None and self.latest_frame_index > self.last_analyzed_source_frame_index:
+                self.dropped_frame_count += 1
+            self.latest_frame = frame
+            self.latest_frame_index = int(frame_index)
+            self.latest_captured_at = float(captured_at)
+
+        self._fps_window_frames += 1
+        elapsed = now - self._fps_window_started_at
+        if elapsed >= 1.0:
+            self.source_fps = float(self._fps_window_frames) / max(1e-6, elapsed)
+            self._fps_window_frames = 0
+            self._fps_window_started_at = now
+
+    def next_frame_for_analysis(self) -> tuple[np.ndarray, int, float] | None:
+        interval = max(1, int(self.args.inference_interval))
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            if self.latest_frame_index - self.last_analyzed_source_frame_index < interval:
+                return None
+            self.last_analyzed_source_frame_index = self.latest_frame_index
+            return self.latest_frame, self.latest_frame_index, self.latest_captured_at
+
+    def analyzed_fps(self) -> float:
+        elapsed = time.monotonic() - self.started_at
+        if elapsed <= 0:
+            return 0.0
+        return float(self.analyzed_frames) / elapsed
+
+    def process_next_analysis(self) -> bool:
+        snapshot = self.next_frame_for_analysis()
+        if snapshot is None:
+            return False
+
+        frame, source_frame_index, _captured_at = snapshot
+        self.analyzed_frames += 1
+        people = self.analyzer.analyze_frame(frame)
+        if self.cam_type == "G":
+            self._handle_gallery_people(frame, people, source_frame_index)
+        else:
+            self._handle_query_people(frame, people)
+        self._send_status(people)
+        self._show_analysis_preview(frame, people)
+
+        if self.analyzed_frames % max(1, self.args.print_interval_frames) == 0:
+            print(
+                f"[cam {self.cam_id}] role={self.cam_type} people={len(people)} "
+                f"gallery={self.gallery.count()} tracker={self.args.tracker_backend} "
+                f"source_fps={self.source_fps:.1f} analyzed_fps={self.analyzed_fps():.1f} "
+                f"dropped={self.dropped_frame_count} inference_ms={self.analyzer.last_inference_ms:.1f}"
+            )
+        return True
 
     def run(self) -> None:
         print(
@@ -1042,7 +1237,7 @@ class LiveTopKCameraWorker(threading.Thread):
             self.analyzed_frames += 1
             people = self.analyzer.analyze_frame(frame)
             if self.cam_type == "G":
-                self._handle_gallery_people(frame, people)
+                self._handle_gallery_people(frame, people, self.frame_index)
             else:
                 self._handle_query_people(frame, people)
             self._send_status(people)
@@ -1055,40 +1250,59 @@ class LiveTopKCameraWorker(threading.Thread):
                 )
 
     def _write_active_recorders(self, frame: np.ndarray) -> None:
-        for recorder in list(self.recorders.values()):
-            recorder.write_frame(frame)
-            if recorder.should_force_close(self.args.max_clip_seconds):
-                self._finalize_recorder(recorder.track_id, "max_clip_seconds")
+        force_close_track_ids = []
+        with self.recorder_lock:
+            for recorder in list(self.recorders.values()):
+                recorder.write_frame(frame)
+                if recorder.should_force_close(self.args.max_clip_seconds):
+                    force_close_track_ids.append(recorder.track_id)
+        for track_id in force_close_track_ids:
+            self._finalize_recorder(track_id, "max_clip_seconds")
 
-    def _handle_gallery_people(self, frame: np.ndarray, people: list[dict[str, object]]) -> None:
+    def _handle_gallery_people(
+        self,
+        frame: np.ndarray,
+        people: list[dict[str, object]],
+        source_frame_index: int = 0,
+    ) -> None:
         current_track_ids = {int(person.get("track_id", 0)) for person in people}
-        for track_id, recorder in list(self.recorders.items()):
-            if track_id not in current_track_ids:
-                recorder.missing_analyses += 1
-                if recorder.missing_analyses > max(1, int(self.args.track_missing_grace)):
-                    self._finalize_recorder(track_id, "person_left_frame")
+        now = time.monotonic()
+        close_track_ids = []
+        with self.recorder_lock:
+            for track_id, recorder in list(self.recorders.items()):
+                if track_id not in current_track_ids:
+                    recorder.mark_missing(now)
+                    if recorder.should_close_after_missing(
+                        float(self.args.post_roll_seconds),
+                        int(self.args.track_missing_grace),
+                    ):
+                        close_track_ids.append(track_id)
+        for track_id in close_track_ids:
+            self._finalize_recorder(track_id, "person_left_frame")
 
         for person in people:
             track_id = int(person.get("track_id", 0))
             if track_id <= 0:
                 continue
-            recorder = self.recorders.get(track_id)
-            if recorder is None:
-                output_size = self.output_size
-                if self.args.record_video_mode == "full-frame":
-                    output_size = (int(frame.shape[1]), int(frame.shape[0]))
-                recorder = PersonClipRecorder(
-                    self.session_id,
-                    self.snapshot_root,
-                    self.cam_id,
-                    self.cam_label,
-                    track_id,
-                    output_size,
-                    fps=30.0,
-                    record_video_mode=str(self.args.record_video_mode),
-                )
-                self.recorders[track_id] = recorder
-            recorder.observe(frame, person)
+            with self.recorder_lock:
+                recorder = self.recorders.get(track_id)
+                if recorder is None:
+                    output_size = self.output_size
+                    if self.args.record_video_mode == "full-frame":
+                        output_size = (int(frame.shape[1]), int(frame.shape[0]))
+                    recorder = PersonClipRecorder(
+                        self.session_id,
+                        self.snapshot_root,
+                        self.cam_id,
+                        self.cam_label,
+                        track_id,
+                        output_size,
+                        fps=30.0,
+                        record_video_mode=str(self.args.record_video_mode),
+                        top_n=max(1, int(self.args.live_visual_top_n)),
+                    )
+                    self.recorders[track_id] = recorder
+                recorder.observe(frame, person, source_frame_index)
 
     def _handle_query_people(self, frame: np.ndarray, people: list[dict[str, object]]) -> None:
         if not people:
@@ -1120,6 +1334,10 @@ class LiveTopKCameraWorker(threading.Thread):
         )
         structured_payload["embedding_method"] = method
         structured_payload["query_quality"] = round(visual_crop_quality(crop, target, frame.shape), 4)
+        structured_payload["tracker_backend"] = str(self.args.tracker_backend)
+        structured_payload["source_fps"] = round(float(self.source_fps), 3)
+        structured_payload["analyzed_fps"] = round(float(self.analyzed_fps()), 3)
+        structured_payload["dropped_frame_count"] = int(self.dropped_frame_count)
         export_dir = self._export_topk_results(crop, structured_payload)
         if export_dir:
             structured_payload["export_dir"] = export_dir
@@ -1168,7 +1386,14 @@ class LiveTopKCameraWorker(threading.Thread):
         self.osc.send(f"{base}/role", self.cam_type)
         self.osc.send(f"{base}/cam_label", self.cam_label)
         self.osc.send(f"{base}/gallery_count", int(self.gallery.count()))
-        self.osc.send(f"{base}/active_recordings", int(len(self.recorders)))
+        self.osc.send(f"{base}/active_recordings", int(self.active_recording_count()))
+        self.osc.send(f"{base}/source_fps", float(self.source_fps))
+        self.osc.send(f"{base}/analyzed_fps", float(self.analyzed_fps()))
+        self.osc.send(f"{base}/dropped_frame_count", int(self.dropped_frame_count))
+
+    def active_recording_count(self) -> int:
+        with self.recorder_lock:
+            return len(self.recorders)
 
     def _show_analysis_preview(self, frame: np.ndarray, people: list[dict[str, object]]) -> None:
         if not self.args.show_preview:
@@ -1180,7 +1405,7 @@ class LiveTopKCameraWorker(threading.Thread):
             self.cam_label,
             self.cam_type,
             self.gallery.count(),
-            len(self.recorders),
+            self.active_recording_count(),
             self.analyzer.last_inference_ms,
         )
         enqueue_preview_window(
@@ -1234,10 +1459,20 @@ class LiveTopKCameraWorker(threading.Thread):
         return str(query_dir.resolve()).replace("\\", "/")
 
     def _finalize_recorder(self, track_id: int, reason: str) -> None:
-        recorder = self.recorders.pop(track_id, None)
+        with self.recorder_lock:
+            recorder = self.recorders.pop(track_id, None)
         if recorder is None:
             return
-        record = recorder.close(self.embedder, reason)
+        record = recorder.close(
+            self.embedder,
+            reason,
+            min_clip_seconds=float(self.args.min_clip_seconds),
+            tracker_backend=str(self.args.tracker_backend),
+            source_fps=float(self.source_fps),
+            analyzed_fps=float(self.analyzed_fps()),
+            dropped_frame_count=int(self.dropped_frame_count),
+            post_roll_seconds=float(self.args.post_roll_seconds),
+        )
         if record is None:
             return
         if self.args.show_preview and self.args.preview_reid_crops and recorder.best_crop is not None:
@@ -1292,8 +1527,113 @@ class LiveTopKCameraWorker(threading.Thread):
         )
 
     def _close_all_recorders(self, reason: str) -> None:
-        for track_id in list(self.recorders):
+        with self.recorder_lock:
+            track_ids = list(self.recorders)
+        for track_id in track_ids:
             self._finalize_recorder(track_id, reason)
+
+
+class CaptureWorker(threading.Thread):
+    def __init__(
+        self,
+        context: LiveTopKCameraContext,
+        stop_event: threading.Event,
+        started_at: float,
+    ):
+        super().__init__(daemon=True)
+        self.context = context
+        self.stop_event = stop_event
+        self.started_at = started_at
+
+    def run(self) -> None:
+        context = self.context
+        print(
+            f"[cam {context.cam_id}] Starting capture worker role={context.cam_type} "
+            f"label={context.cam_label} source={context.source_info['display']}"
+        )
+        while not self.stop_event.is_set():
+            if self._runtime_expired():
+                self.stop_event.set()
+                break
+
+            cap = create_capture(context.video_source, context.args.frame_width, context.args.frame_height)
+            if not cap.isOpened():
+                print(f"[cam {context.cam_id}] Failed to open {context.source_info['display']}; retrying.")
+                time.sleep(context.args.reconnect_delay)
+                continue
+
+            try:
+                self._capture_loop(cap)
+            finally:
+                cap.release()
+                context._close_all_recorders("capture_closed")
+
+            if not self.stop_event.is_set():
+                time.sleep(context.args.reconnect_delay)
+
+    def _runtime_expired(self) -> bool:
+        max_runtime = float(self.context.args.max_runtime_seconds)
+        return max_runtime > 0 and time.monotonic() - self.started_at >= max_runtime
+
+    def _capture_loop(self, cap: cv2.VideoCapture) -> None:
+        context = self.context
+        while not self.stop_event.is_set():
+            if self._runtime_expired():
+                self.stop_event.set()
+                break
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                context.read_failures += 1
+                if context.read_failures >= context.args.max_read_failures:
+                    print(f"[cam {context.cam_id}] Read failure threshold reached.")
+                    break
+                time.sleep(0.05)
+                continue
+
+            context.read_failures = 0
+            context.frame_index += 1
+            captured_at = time.monotonic()
+            context.update_latest_frame(frame, context.frame_index, captured_at)
+            context._write_active_recorders(frame)
+
+
+class InferenceCoordinator(threading.Thread):
+    def __init__(
+        self,
+        contexts: list[LiveTopKCameraContext],
+        args: argparse.Namespace,
+        stop_event: threading.Event,
+        started_at: float,
+    ):
+        super().__init__(daemon=True)
+        self.contexts = contexts
+        self.args = args
+        self.stop_event = stop_event
+        self.started_at = started_at
+
+    def run(self) -> None:
+        print(
+            "[inference] Starting round-robin coordinator "
+            f"tracker={self.args.tracker_backend} interval={self.args.inference_interval}"
+        )
+        while not self.stop_event.is_set():
+            if self._runtime_expired():
+                self.stop_event.set()
+                break
+
+            processed_any = False
+            for context in self.contexts:
+                if self.stop_event.is_set():
+                    break
+                processed_any = context.process_next_analysis() or processed_any
+
+            if not processed_any:
+                time.sleep(0.005)
+
+    def _runtime_expired(self) -> bool:
+        max_runtime = float(self.args.max_runtime_seconds)
+        return max_runtime > 0 and time.monotonic() - self.started_at >= max_runtime
 
 
 def main() -> int:
@@ -1319,6 +1659,12 @@ def main() -> int:
     print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
     print(f"Record video mode: {args.record_video_mode}")
+    print(
+        f"Tracker backend: {args.tracker_backend} "
+        f"inference_interval={args.inference_interval} "
+        f"post_roll_seconds={args.post_roll_seconds} "
+        f"min_clip_seconds={args.min_clip_seconds}"
+    )
     print(f"Embedding model: {args.embedding_model} method={embedder.method} device={embedder.device}")
     if args.show_preview:
         print("Preview windows: enabled. Press q or Esc in a preview window to stop.")
@@ -1334,8 +1680,8 @@ def main() -> int:
     for index, (source, cam_type, cam_label) in enumerate(zip(sources, cam_types, cam_labels), start=1):
         print(f"cam{index}: role={cam_type} label={cam_label} source={parse_video_source(source)['display']}")
 
-    workers = [
-        LiveTopKCameraWorker(
+    contexts = [
+        LiveTopKCameraContext(
             cam_id=index,
             cam_label=cam_label,
             cam_type=cam_type,
@@ -1350,11 +1696,16 @@ def main() -> int:
         for index, (source, cam_type, cam_label) in enumerate(zip(sources, cam_types, cam_labels), start=1)
     ]
 
-    for worker in workers:
+    started_at = time.monotonic()
+    capture_workers = [CaptureWorker(context, stop_event, started_at) for context in contexts]
+    inference_worker = InferenceCoordinator(contexts, args, stop_event, started_at)
+
+    for worker in capture_workers:
         worker.start()
+    inference_worker.start()
 
     try:
-        while any(worker.is_alive() for worker in workers):
+        while any(worker.is_alive() for worker in capture_workers) and not stop_event.is_set():
             if args.show_preview and process_preview_events():
                 stop_event.set()
                 break
@@ -1364,8 +1715,9 @@ def main() -> int:
         stop_event.set()
     finally:
         stop_event.set()
-        for worker in workers:
+        for worker in capture_workers:
             worker.join(timeout=5.0)
+        inference_worker.join(timeout=5.0)
         if args.show_preview:
             with PREVIEW_LOCK:
                 cv2.destroyAllWindows()

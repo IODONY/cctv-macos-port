@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from live_topk_bridge import (  # noqa: E402
     GalleryRecord,
     LiveTopKGallery,
+    PersonClipRecorder,
     build_topk_payload,
     export_asset,
     export_similarity_group_record,
@@ -199,6 +200,54 @@ def test_similarity_group_export() -> None:
     shutil.rmtree(test_root, ignore_errors=True)
 
 
+def test_person_clip_recorder_topn_embedding() -> None:
+    class UnitEmbedder:
+        method = "unit_embedder"
+
+        def embed_bgr(self, image_bgr):
+            value = float(image_bgr.mean()) + 1.0
+            return normalize_vector(np.asarray([value, 1.0], dtype=np.float32)), self.method
+
+    test_root = PROJECT_ROOT / "logs" / "test_person_clip_recorder"
+    shutil.rmtree(test_root, ignore_errors=True)
+    recorder = PersonClipRecorder(
+        session_id="unit_session",
+        snapshot_root=test_root,
+        cam_id=1,
+        cam_label="tapo_1",
+        track_id=7,
+        output_size=(64, 64),
+        fps=10.0,
+        record_video_mode="full-frame",
+        top_n=3,
+    )
+    person = {"box": (10, 5, 42, 60), "confidence": 0.95}
+    for index in range(5):
+        frame = np.full((64, 64, 3), 30 + (index * 20), dtype=np.uint8)
+        recorder.observe(frame, person, frame_index=index + 1)
+        recorder.write_frame(frame)
+
+    record = recorder.close(
+        UnitEmbedder(),
+        reason="unit_done",
+        min_clip_seconds=0.0,
+        tracker_backend="botsort",
+        source_fps=10.0,
+        analyzed_fps=5.0,
+        dropped_frame_count=2,
+        post_roll_seconds=2.0,
+    )
+    assert record is not None
+    assert record.cam_label == "tapo_1"
+    assert record.tracker_backend == "botsort"
+    assert record.embedding_aggregation == "mean_top_3"
+    assert len(record.top_crop_paths or []) == 3
+    assert Path(record.clip_path).exists()
+    assert Path(record.best_frame_path).exists()
+    assert all(Path(path).exists() for path in record.top_crop_paths or [])
+    shutil.rmtree(test_root, ignore_errors=True)
+
+
 def test_regroup_live_session_export() -> None:
     session_id = "unit_regroup"
     log_root = PROJECT_ROOT / "logs" / "topk_live" / session_id
@@ -259,6 +308,7 @@ def main() -> int:
     test_topk_payload_shape()
     test_export_helpers()
     test_similarity_group_export()
+    test_person_clip_recorder_topn_embedding()
     test_regroup_live_session_export()
     print("LIVE_TOPK_UNIT_OK")
     return 0

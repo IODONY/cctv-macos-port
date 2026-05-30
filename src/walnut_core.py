@@ -16,6 +16,7 @@ from ultralytics import YOLO
 
 
 class WalnutAnalyzer:
+    TRACKER_BACKENDS = {"custom", "botsort", "bytetrack"}
     TORSO_RATIO_CONFIDENCE = 0.4
     KEYPOINT_INDEX = {
         "nose": 0,
@@ -45,6 +46,8 @@ class WalnutAnalyzer:
         model_imgsz=640,
         vote_frame_window=75,
         track_max_missing=15,
+        tracker_backend="custom",
+        tracker_config_path=None,
     ):
         self.pose_model_name = pose_model_name
         self.detect_model_name = detect_model_name
@@ -54,6 +57,8 @@ class WalnutAnalyzer:
         self.model_imgsz = model_imgsz
         self.vote_frame_window = max(1, int(vote_frame_window))
         self.track_max_missing = max(1, int(track_max_missing))
+        self.tracker_backend = self._normalize_tracker_backend(tracker_backend)
+        self.tracker_config_path = tracker_config_path
 
         self.device = self._select_device()
         self.use_half = self.device.startswith("cuda")
@@ -71,6 +76,7 @@ class WalnutAnalyzer:
         self.last_inference_ms = 0.0
         self.next_track_id = 1
         self.tracks = {}
+        self.external_tracks = {}
 
         cv2.setUseOptimized(True)
         if self.device.startswith("cuda"):
@@ -80,16 +86,7 @@ class WalnutAnalyzer:
         self.frame_index += 1
         start_time = time.perf_counter()
 
-        pose_results = self.pose_model.predict(
-            source=frame,
-            conf=self.person_confidence,
-            verbose=False,
-            device=self.device,
-            half=self.use_half,
-            imgsz=self.model_imgsz,
-            max_det=20,
-            classes=[0],
-        )
+        pose_results = self._run_pose_model(frame)
         detect_results = self.detect_model.predict(
             source=frame,
             conf=min(self.person_confidence, self.accessory_confidence),
@@ -105,6 +102,43 @@ class WalnutAnalyzer:
         pose_result = pose_results[0] if pose_results else None
         detect_result = detect_results[0] if detect_results else None
         return self._build_scene(frame, pose_result, detect_result)
+
+    def _normalize_tracker_backend(self, tracker_backend):
+        normalized = str(tracker_backend or "custom").strip().lower()
+        if normalized not in self.TRACKER_BACKENDS:
+            allowed = ", ".join(sorted(self.TRACKER_BACKENDS))
+            raise ValueError(f"Unsupported tracker_backend '{tracker_backend}'. Use one of: {allowed}.")
+        return normalized
+
+    def _tracker_config(self):
+        if self.tracker_config_path:
+            return str(self.tracker_config_path)
+        if self.tracker_backend == "botsort":
+            project_config = PROJECT_ROOT / "configs" / "trackers" / "botsort.yaml"
+            return str(project_config) if project_config.is_file() else "botsort.yaml"
+        if self.tracker_backend == "bytetrack":
+            project_config = PROJECT_ROOT / "configs" / "trackers" / "bytetrack.yaml"
+            return str(project_config) if project_config.is_file() else "bytetrack.yaml"
+        return None
+
+    def _run_pose_model(self, frame):
+        common_kwargs = {
+            "source": frame,
+            "conf": self.person_confidence,
+            "verbose": False,
+            "device": self.device,
+            "half": self.use_half,
+            "imgsz": self.model_imgsz,
+            "max_det": 20,
+            "classes": [0],
+        }
+        if self.tracker_backend == "custom":
+            return self.pose_model.predict(**common_kwargs)
+        return self.pose_model.track(
+            **common_kwargs,
+            persist=True,
+            tracker=self._tracker_config(),
+        )
 
     def _select_device(self):
         if torch.cuda.is_available():
@@ -150,7 +184,9 @@ class WalnutAnalyzer:
             if owner is not None:
                 owner["bags"].append(bag)
 
-        return self._update_tracks(people)
+        if self.tracker_backend == "custom":
+            return self._update_tracks(people)
+        return self._update_external_tracks(people)
 
     def _extract_people_from_pose(self, frame, pose_result):
         if pose_result is None or pose_result.boxes is None or pose_result.keypoints is None:
@@ -159,6 +195,9 @@ class WalnutAnalyzer:
         boxes = pose_result.boxes.xyxy.detach().cpu().numpy().astype(int)
         confidences = pose_result.boxes.conf.detach().cpu().numpy()
         keypoints_xy = pose_result.keypoints.xy.detach().cpu().numpy()
+        track_ids = None
+        if getattr(pose_result.boxes, "id", None) is not None:
+            track_ids = pose_result.boxes.id.detach().cpu().numpy()
         keypoints_conf = (
             pose_result.keypoints.conf.detach().cpu().numpy()
             if pose_result.keypoints.conf is not None
@@ -178,10 +217,17 @@ class WalnutAnalyzer:
             regions = self._compute_pose_region_colors(frame, clipped_box, kpts_xy, kpts_conf)
             limb_coverage = self._compute_limb_coverage(frame, kpts_xy, kpts_conf)
             torso_ratio = self._compute_torso_ratio(kpts_xy, kpts_conf)
+            external_track_id = None
+            if track_ids is not None and index < len(track_ids):
+                try:
+                    external_track_id = int(track_ids[index])
+                except (TypeError, ValueError):
+                    external_track_id = None
             people.append(
                 {
                     "box": clipped_box,
                     "confidence": float(confidence),
+                    "external_track_id": external_track_id,
                     "regions": regions,
                     "brightness_ratio": self._compute_brightness_ratio_from_regions(regions),
                     "is_long_sleeve": limb_coverage["is_long_sleeve"],
@@ -239,6 +285,35 @@ class WalnutAnalyzer:
             tracked_people.append(self._build_person_view(track, person))
 
         self._cleanup_stale_tracks(matched_track_ids)
+        return tracked_people
+
+    def _update_external_tracks(self, detected_people):
+        matched_track_ids = set()
+        tracked_people = []
+
+        for person in detected_people:
+            external_track_id = person.get("external_track_id")
+            if external_track_id is None:
+                continue
+            track_id = int(external_track_id)
+            if track_id <= 0:
+                continue
+
+            track = self.external_tracks.setdefault(
+                track_id,
+                {
+                    "id": track_id,
+                    "first_seen_frame": self.frame_index,
+                    "last_seen_frame": self.frame_index,
+                    "observed_frames": 0,
+                },
+            )
+            track["last_seen_frame"] = self.frame_index
+            track["observed_frames"] = int(track.get("observed_frames", 0)) + 1
+            matched_track_ids.add(track_id)
+            tracked_people.append(self._build_external_person_view(track, person))
+
+        self._cleanup_external_tracks(matched_track_ids)
         return tracked_people
 
     def _create_track(self, person):
@@ -439,6 +514,31 @@ class WalnutAnalyzer:
             "inference_ms": self.last_inference_ms,
         }
 
+    def _build_external_person_view(self, track, person):
+        return {
+            "id": track["id"],
+            "track_id": track["id"],
+            "tracker_backend": self.tracker_backend,
+            "box": person["box"],
+            "confidence": person["confidence"],
+            "regions": person["regions"],
+            "is_long_sleeve": person["is_long_sleeve"],
+            "is_long_pants": person["is_long_pants"],
+            "limb_samples": person["limb_samples"],
+            "torso_lines": person["torso_lines"],
+            "torso_ratio": person.get("torso_ratio"),
+            "brightness_ratio": person.get("brightness_ratio"),
+            "bags": person["bags"],
+            "observed_frames": track["observed_frames"],
+            "final_profile": None,
+            "visitor_metadata": None,
+            "visitor_id": track["id"],
+            "resolved": False,
+            "skip_reason": None,
+            "log_record": None,
+            "inference_ms": self.last_inference_ms,
+        }
+
     def _cleanup_stale_tracks(self, matched_track_ids):
         stale_track_ids = [
             track_id
@@ -449,6 +549,17 @@ class WalnutAnalyzer:
 
         for track_id in stale_track_ids:
             del self.tracks[track_id]
+
+    def _cleanup_external_tracks(self, matched_track_ids):
+        stale_track_ids = [
+            track_id
+            for track_id, track in self.external_tracks.items()
+            if track_id not in matched_track_ids
+            and self.frame_index - track["last_seen_frame"] > self.track_max_missing
+        ]
+
+        for track_id in stale_track_ids:
+            del self.external_tracks[track_id]
 
     def _clip_box(self, frame, box):
         height, width = frame.shape[:2]

@@ -160,6 +160,8 @@ def reset_analyzer_state(analyzer) -> None:
     analyzer.last_inference_ms = 0.0
     analyzer.next_track_id = 1
     analyzer.tracks = {}
+    if hasattr(analyzer, "external_tracks"):
+        analyzer.external_tracks = {}
 
 
 class BestShotSelector:

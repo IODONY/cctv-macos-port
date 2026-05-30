@@ -145,7 +145,7 @@ def main() -> int:
     parser.add_argument("--events-path", help="Explicit gallery_events.jsonl path.")
     parser.add_argument("--embedding-model", default="osnet_x0_25")
     parser.add_argument("--thresholds", type=parse_thresholds, default=parse_thresholds("0.50,0.55,0.60,0.65,0.70"))
-    parser.add_argument("--reciprocal-topn", type=int, default=5)
+    parser.add_argument("--reciprocal-topn", type=int, default=3)
     parser.add_argument("--output-report", default="")
     args = parser.parse_args()
 

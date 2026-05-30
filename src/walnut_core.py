@@ -114,10 +114,10 @@ class WalnutAnalyzer:
         if self.tracker_config_path:
             return str(self.tracker_config_path)
         if self.tracker_backend == "botsort":
-            project_config = PROJECT_ROOT / "configs" / "trackers" / "botsort.yaml"
+            project_config = PROJECT_ROOT / "config" / "trackers" / "botsort.yaml"
             return str(project_config) if project_config.is_file() else "botsort.yaml"
         if self.tracker_backend == "bytetrack":
-            project_config = PROJECT_ROOT / "configs" / "trackers" / "bytetrack.yaml"
+            project_config = PROJECT_ROOT / "config" / "trackers" / "bytetrack.yaml"
             return str(project_config) if project_config.is_file() else "bytetrack.yaml"
         return None
 

@@ -244,6 +244,19 @@ def test_person_clip_recorder_topn_embedding() -> None:
     assert record.tracker_backend == "botsort"
     assert record.embedding_aggregation == "mean_top_3"
     assert len(record.top_crop_paths or []) == 3
+    assert len(record.top_crop_metadata or []) == 3
+    assert record.best_crop_box == [10, 5, 42, 60]
+    assert record.best_crop_frame_index >= 1
+    assert record.best_crop_quality > 0.0
+    for item in record.top_crop_metadata or []:
+        assert item["track_id"] == 7
+        assert item["box"] == [10, 5, 42, 60]
+        assert int(item["frame_index"]) >= 1
+        assert float(item["quality"]) > 0.0
+    payload = record.to_json()
+    assert payload["best_crop"]["track_id"] == 7
+    assert payload["best_crop"]["box"] == [10, 5, 42, 60]
+    assert len(payload["top_crop_metadata"]) == 3
     assert Path(record.clip_path).exists()
     assert Path(record.best_frame_path).exists()
     assert all(Path(path).exists() for path in record.top_crop_paths or [])

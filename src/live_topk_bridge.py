@@ -655,6 +655,11 @@ class GalleryRecord:
     dropped_frame_count: int = 0
     post_roll_seconds: float = 0.0
     top_crop_paths: list[str] | None = None
+    best_crop_frame_index: int = 0
+    best_crop_box: list[int] | None = None
+    best_crop_confidence: float = 0.0
+    best_crop_quality: float = 0.0
+    top_crop_metadata: list[dict[str, object]] | None = None
     similarity_group_id: int = 0
     similarity_group_label: str = ""
     similarity_group_score: float = 0.0
@@ -684,6 +689,17 @@ class GalleryRecord:
         }
         if self.top_crop_paths:
             payload["top_crop_paths"] = list(self.top_crop_paths)
+        if self.best_crop_box:
+            payload["best_crop"] = {
+                "track_id": int(self.track_id),
+                "frame_index": int(self.best_crop_frame_index),
+                "box": [int(value) for value in self.best_crop_box],
+                "confidence": round(float(self.best_crop_confidence), 6),
+                "quality": round(float(self.best_crop_quality or self.quality), 6),
+                "path": self.best_frame_path,
+            }
+        if self.top_crop_metadata:
+            payload["top_crop_metadata"] = list(self.top_crop_metadata)
         if self.similarity_group_label:
             payload.update(
                 {
@@ -853,6 +869,7 @@ class PersonClipRecorder:
         self.frame_count = 0
         self.best_crop = None
         self.best_quality = -1.0
+        self.best_candidate_metadata: dict[str, object] | None = None
         self.crop_candidates: list[dict[str, object]] = []
         self.closed = False
         if self.writer is None:
@@ -883,6 +900,12 @@ class PersonClipRecorder:
             best = self.crop_candidates[0]
             self.best_crop = best["crop"]
             self.best_quality = float(best["quality"])
+            self.best_candidate_metadata = {
+                "frame_index": int(best["frame_index"]),
+                "box": [int(value) for value in best["box"]],
+                "confidence": float(best["confidence"]),
+                "quality": float(best["quality"]),
+            }
 
     def mark_missing(self, now: float | None = None) -> None:
         self.missing_analyses += 1
@@ -948,6 +971,7 @@ class PersonClipRecorder:
 
         self.best_frame_path.parent.mkdir(parents=True, exist_ok=True)
         top_crop_paths: list[str] = []
+        top_crop_metadata: list[dict[str, object]] = []
         crop_embeddings = []
         methods = []
         for index, candidate in enumerate(self.crop_candidates[: self.top_n], start=1):
@@ -959,7 +983,19 @@ class PersonClipRecorder:
                     f"{self.best_frame_path.stem}_crop_{index:03d}{self.best_frame_path.suffix}"
                 )
             cv2.imwrite(str(crop_path), crop)
-            top_crop_paths.append(str(crop_path.resolve()).replace("\\", "/"))
+            resolved_crop_path = str(crop_path.resolve()).replace("\\", "/")
+            top_crop_paths.append(resolved_crop_path)
+            top_crop_metadata.append(
+                {
+                    "rank": int(index),
+                    "path": resolved_crop_path,
+                    "track_id": int(self.track_id),
+                    "frame_index": int(candidate["frame_index"]),
+                    "box": [int(value) for value in candidate["box"]],
+                    "confidence": round(float(candidate["confidence"]), 6),
+                    "quality": round(float(candidate["quality"]), 6),
+                }
+            )
             embedding, method = embedder.embed_bgr(crop)
             if embedding is not None:
                 crop_embeddings.append(embedding)
@@ -974,6 +1010,7 @@ class PersonClipRecorder:
             print(f"[gallery] No embedding for track {self.track_id}: {self.clip_path}")
             return None
 
+        best_metadata = top_crop_metadata[0] if top_crop_metadata else (self.best_candidate_metadata or {})
         return GalleryRecord(
             clip_id=self.clip_id,
             clip_path=str(self.clip_path.resolve()).replace("\\", "/"),
@@ -995,6 +1032,11 @@ class PersonClipRecorder:
             dropped_frame_count=int(dropped_frame_count),
             post_roll_seconds=float(post_roll_seconds),
             top_crop_paths=top_crop_paths,
+            best_crop_frame_index=int(best_metadata.get("frame_index") or 0),
+            best_crop_box=list(best_metadata.get("box") or []),
+            best_crop_confidence=float(best_metadata.get("confidence") or 0.0),
+            best_crop_quality=float(best_metadata.get("quality") or self.best_quality or 0.0),
+            top_crop_metadata=top_crop_metadata,
         )
 
 

@@ -23,7 +23,7 @@ def main() -> int:
     parser.add_argument("--embedding-model", default="osnet_x0_25")
     parser.add_argument("--method", choices=("connected", "reciprocal"), default="reciprocal")
     parser.add_argument("--threshold", type=float, default=0.65)
-    parser.add_argument("--reciprocal-topn", type=int, default=8)
+    parser.add_argument("--reciprocal-topn", type=int, default=4)
     parser.add_argument("--export-mode", choices=("symlink", "copy", "path"), default="symlink")
     parser.add_argument("--snapshot-root", default="snapshots/live_topk")
     parser.add_argument("--output-subdir", default="similarity_groups_merged")

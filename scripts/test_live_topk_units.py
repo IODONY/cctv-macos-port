@@ -16,6 +16,7 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from live_topk_bridge import (  # noqa: E402
     GalleryRecord,
@@ -26,12 +27,15 @@ from live_topk_bridge import (  # noqa: E402
     export_similarity_group_record,
     normalize_cam_type,
     normalize_vector,
+    resolve_tracker_config_path,
     split_cam_labels,
     split_cam_types,
     split_sources,
+    tracker_config_with_reid,
     write_json,
 )
 from live_session_grouping import regroup_live_session  # noqa: E402
+from run_live_from_camera_csv import resolve_tracker_config_arg  # noqa: E402
 from visual_grouping import VisualGroupRecord, group_records, reciprocal_groups  # noqa: E402
 
 
@@ -62,6 +66,32 @@ def test_source_parsing() -> None:
     assert split_cam_labels("", 2) == ["cam_1", "cam_2"]
     assert normalize_cam_type("a") == "G"
     assert normalize_cam_type("c") == "Q"
+
+
+def test_tracker_config_resolution() -> None:
+    botsort_path = resolve_tracker_config_path("botsort", "")
+    assert botsort_path is not None
+    assert botsort_path.name == "botsort.yaml"
+    assert tracker_config_with_reid(botsort_path) is False
+
+    botsort_reid_path = resolve_tracker_config_path("botsort", "config/trackers/botsort_reid.yaml")
+    assert botsort_reid_path is not None
+    assert botsort_reid_path.name == "botsort_reid.yaml"
+    assert tracker_config_with_reid(botsort_reid_path) is True
+
+    assert resolve_tracker_config_path("custom", "") is None
+    assert tracker_config_with_reid(None) is None
+
+    class Args:
+        tracker_backend = "botsort"
+        tracker_config_path = ""
+        tracker_reid = True
+
+    assert resolve_tracker_config_arg(Args()) == "config/trackers/botsort_reid.yaml"
+
+    Args.tracker_reid = False
+    Args.tracker_config_path = "config/trackers/botsort.yaml"
+    assert resolve_tracker_config_arg(Args()) == "config/trackers/botsort.yaml"
 
 
 def test_gallery_ranking() -> None:
@@ -316,6 +346,7 @@ def test_regroup_live_session_export() -> None:
 
 def main() -> int:
     test_source_parsing()
+    test_tracker_config_resolution()
     test_gallery_ranking()
     test_similarity_grouping()
     test_visual_grouping_connected_chain()

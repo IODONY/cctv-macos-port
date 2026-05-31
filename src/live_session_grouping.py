@@ -226,7 +226,7 @@ def regroup_live_session(
     embedding_model: str = "osnet_x0_25",
     method: str = "reciprocal",
     threshold: float = 0.65,
-    reciprocal_topn: int = 8,
+    reciprocal_topn: int = 4,
     export_mode: str = "symlink",
     snapshot_root: Path | None = None,
     output_subdir: str = "similarity_groups_merged",

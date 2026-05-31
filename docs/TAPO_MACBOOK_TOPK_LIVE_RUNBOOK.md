@@ -97,8 +97,8 @@ python scripts/regroup_live_session.py \
   --session <session_id> \
   --embedding-model osnet_x0_25 \
   --method reciprocal \
-  --threshold 0.55 \
-  --reciprocal-topn 5 \
+  --threshold 0.65 \
+  --reciprocal-topn 4 \
   --export-mode symlink \
   --write-report docs/reports/LIVE_SESSION_REGROUP_REPORT.md
 
@@ -207,8 +207,9 @@ Important CLI parameters:
 - `--preview-reid-crops`: also show the selected ReID crop whenever a track is embedded.
 - `--storage-layout similarity`: mirror gallery clips into appearance-similarity folders for debugging.
 - `--similarity-group-threshold 0.72`: grouping threshold for that temporary review layout.
-- `--merge-threshold 0.55`: final session-end grouping threshold.
-- `--merge-reciprocal-topn 5`: mutual neighbor count for final session-end grouping.
+- `--tracker-config-path config/trackers/botsort_reid.yaml`: enable BoT-SORT tracker-side ReID explicitly.
+- `--merge-threshold 0.65`: final session-end grouping threshold.
+- `--merge-reciprocal-topn 4`: mutual neighbor count for final session-end grouping. This is intentionally more conservative than the earlier 8-neighbor default to reduce over-merged people in multi-person sessions.
 - `--no-session-end-merge`: keep only the online temporary similarity folders.
 - `--export-topk-dir snapshots/topk_exports`: query-by-query export bundles for TouchDesigner-free testing.
 - `--disable-osc`: skip all OSC traffic during camera-only validation.

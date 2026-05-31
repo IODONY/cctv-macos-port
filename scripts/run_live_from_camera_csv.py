@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Start Live Top-K from config/cameras/cameras.local.csv.")
     parser.add_argument("--camera-csv", default="config/cameras/cameras.local.csv")
     parser.add_argument("--tracker-backend", choices=("botsort", "bytetrack", "custom"), default="botsort")
+    parser.add_argument("--tracker-config-path", default="")
+    parser.add_argument(
+        "--tracker-reid",
+        action="store_true",
+        help="Use config/trackers/botsort_reid.yaml so BoT-SORT also uses tracker-side ReID.",
+    )
     parser.add_argument("--inference-interval", type=int, default=2)
     parser.add_argument("--post-roll-seconds", type=float, default=2.0)
     parser.add_argument("--min-clip-seconds", type=float, default=1.5)
@@ -30,6 +36,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-model", default="osnet_x0_25")
     parser.add_argument("--record-video-mode", choices=("full-frame", "person-crop"), default="full-frame")
     parser.add_argument("--storage-layout", choices=("camera", "similarity"), default="similarity")
+    parser.add_argument("--similarity-group-threshold", type=float, default=0.72)
+    parser.add_argument("--similarity-export-mode", choices=("symlink", "copy", "path"), default="symlink")
+    parser.add_argument("--merge-method", choices=("connected", "reciprocal"), default="reciprocal")
+    parser.add_argument("--merge-threshold", type=float, default=0.65)
+    parser.add_argument("--merge-reciprocal-topn", type=int, default=4)
+    parser.add_argument("--no-session-end-merge", action="store_true")
     parser.add_argument("--export-topk-dir", default="snapshots/live_topk_exports")
     parser.add_argument("--max-runtime-seconds", type=float, default=0.0)
     parser.add_argument("--disable-osc", action="store_true")
@@ -104,9 +116,21 @@ def load_camera_rows(csv_path: Path) -> list[dict[str, str]]:
     return enabled_rows
 
 
+def resolve_tracker_config_arg(args: argparse.Namespace) -> str:
+    config_path = str(args.tracker_config_path or "").strip()
+    if not args.tracker_reid:
+        return config_path
+    if args.tracker_backend != "botsort":
+        raise ValueError("--tracker-reid can only be used with --tracker-backend botsort")
+    if config_path:
+        raise ValueError("Use either --tracker-reid or --tracker-config-path, not both.")
+    return "config/trackers/botsort_reid.yaml"
+
+
 def main() -> int:
     args = parse_args()
     rows = load_camera_rows(resolve_project_path(args.camera_csv))
+    tracker_config_arg = resolve_tracker_config_arg(args)
 
     env = os.environ.copy()
     env_names = []
@@ -154,7 +178,19 @@ def main() -> int:
         args.record_video_mode,
         "--storage-layout",
         args.storage_layout,
+        "--similarity-group-threshold",
+        str(args.similarity_group_threshold),
+        "--similarity-export-mode",
+        args.similarity_export_mode,
+        "--merge-method",
+        args.merge_method,
+        "--merge-threshold",
+        str(args.merge_threshold),
+        "--merge-reciprocal-topn",
+        str(max(1, int(args.merge_reciprocal_topn))),
     ]
+    if tracker_config_arg:
+        command.extend(["--tracker-config-path", tracker_config_arg])
     if args.export_topk_dir:
         command.extend(["--export-topk-dir", args.export_topk_dir])
     if args.max_runtime_seconds > 0:
@@ -169,6 +205,8 @@ def main() -> int:
         command.append("--preview-reid-crops")
     if args.skip_webcam_preflight:
         command.append("--skip-webcam-preflight")
+    if args.no_session_end_merge:
+        command.append("--no-session-end-merge")
     if args.bridge_args:
         extra_args = args.bridge_args[1:] if args.bridge_args[0] == "--" else args.bridge_args
         command.extend(extra_args)

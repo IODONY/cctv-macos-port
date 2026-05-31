@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-reciprocal-topn",
         type=int,
-        default=8,
+        default=4,
         help="Mutual top-N neighborhood size for reciprocal final grouping.",
     )
     parser.add_argument(
@@ -240,6 +240,40 @@ def resolve_project_path(path_value: str) -> Path:
     except ValueError as exc:
         raise ValueError(f"Path must stay inside project root: {resolved}") from exc
     return resolved
+
+
+def display_project_path(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return str(path.resolve().relative_to(PROJECT_ROOT)).replace("\\", "/")
+    except ValueError:
+        return str(path.resolve()).replace("\\", "/")
+
+
+def resolve_tracker_config_path(tracker_backend: str, tracker_config_path: str = "") -> Path | None:
+    normalized = str(tracker_backend or "").strip().lower()
+    if tracker_config_path:
+        return resolve_project_path(tracker_config_path)
+    if normalized in {"botsort", "bytetrack"}:
+        candidate = PROJECT_ROOT / "config" / "trackers" / f"{normalized}.yaml"
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def tracker_config_with_reid(config_path: Path | None) -> bool | None:
+    if config_path is None or not config_path.is_file():
+        return None
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() != "with_reid":
+            continue
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return None
 
 
 def split_csv(value: str) -> list[str]:
@@ -650,6 +684,8 @@ class GalleryRecord:
     embedding_method: str
     embedding_aggregation: str = "single_best"
     tracker_backend: str = "custom"
+    tracker_config_path: str = ""
+    tracker_with_reid: bool | None = None
     source_fps: float = 0.0
     analyzed_fps: float = 0.0
     dropped_frame_count: int = 0
@@ -687,6 +723,10 @@ class GalleryRecord:
             "dropped_frame_count": int(self.dropped_frame_count),
             "post_roll_seconds": round(float(self.post_roll_seconds), 3),
         }
+        if self.tracker_config_path:
+            payload["tracker_config_path"] = self.tracker_config_path
+        if self.tracker_with_reid is not None:
+            payload["tracker_with_reid"] = bool(self.tracker_with_reid)
         if self.top_crop_paths:
             payload["top_crop_paths"] = list(self.top_crop_paths)
         if self.best_crop_box:
@@ -943,6 +983,8 @@ class PersonClipRecorder:
         reason: str,
         min_clip_seconds: float = 0.0,
         tracker_backend: str = "custom",
+        tracker_config_path: str = "",
+        tracker_with_reid: bool | None = None,
         source_fps: float = 0.0,
         analyzed_fps: float = 0.0,
         dropped_frame_count: int = 0,
@@ -1027,6 +1069,8 @@ class PersonClipRecorder:
             embedding_method=method,
             embedding_aggregation=f"mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
             tracker_backend=str(tracker_backend),
+            tracker_config_path=str(tracker_config_path),
+            tracker_with_reid=tracker_with_reid,
             source_fps=float(source_fps),
             analyzed_fps=float(analyzed_fps),
             dropped_frame_count=int(dropped_frame_count),
@@ -1165,7 +1209,9 @@ class LiveTopKCameraContext:
         self._fps_window_frames = 0
         self.started_at = time.monotonic()
         self.last_query_sent_at = 0.0
-        tracker_config_path = resolve_project_path(args.tracker_config_path) if args.tracker_config_path else None
+        tracker_config_path = resolve_tracker_config_path(str(args.tracker_backend), str(args.tracker_config_path))
+        self.tracker_config_path = display_project_path(tracker_config_path)
+        self.tracker_with_reid = tracker_config_with_reid(tracker_config_path)
 
         self.analyzer = WalnutAnalyzer(
             pose_model_name="yolov8n-pose.pt",
@@ -1518,6 +1564,8 @@ class LiveTopKCameraContext:
             reason,
             min_clip_seconds=float(self.args.min_clip_seconds),
             tracker_backend=str(self.args.tracker_backend),
+            tracker_config_path=self.tracker_config_path,
+            tracker_with_reid=self.tracker_with_reid,
             source_fps=float(self.source_fps),
             analyzed_fps=float(self.analyzed_fps()),
             dropped_frame_count=int(self.dropped_frame_count),
@@ -1703,6 +1751,8 @@ def main() -> int:
     embedder = AppearanceEmbedder(model_name=args.embedding_model)
     osc = OscSender(args.osc_host, args.osc_port, args.osc_dry_run, args.disable_osc)
     stop_event = threading.Event()
+    tracker_config_path = resolve_tracker_config_path(str(args.tracker_backend), str(args.tracker_config_path))
+    tracker_with_reid = tracker_config_with_reid(tracker_config_path)
 
     print("Starting live YOLO-ReID Top-K bridge.")
     print(f"Session: {session_id}")
@@ -1711,6 +1761,8 @@ def main() -> int:
     print(f"Record video mode: {args.record_video_mode}")
     print(
         f"Tracker backend: {args.tracker_backend} "
+        f"tracker_config={display_project_path(tracker_config_path) or 'default'} "
+        f"tracker_with_reid={tracker_with_reid} "
         f"inference_interval={args.inference_interval} "
         f"post_roll_seconds={args.post_roll_seconds} "
         f"min_clip_seconds={args.min_clip_seconds}"
@@ -1722,7 +1774,10 @@ def main() -> int:
         f"Storage layout: {args.storage_layout} "
         f"similarity_threshold={args.similarity_group_threshold} "
         f"similarity_export_mode={args.similarity_export_mode} "
-        f"session_end_merge={not args.no_session_end_merge}"
+        f"session_end_merge={not args.no_session_end_merge} "
+        f"merge_method={args.merge_method} "
+        f"merge_threshold={args.merge_threshold} "
+        f"merge_reciprocal_topn={args.merge_reciprocal_topn}"
     )
     if args.export_topk_dir:
         print(f"Top-K export root: {resolve_project_path(args.export_topk_dir)} mode={args.export_mode}")

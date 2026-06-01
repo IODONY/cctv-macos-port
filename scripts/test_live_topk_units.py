@@ -49,13 +49,14 @@ from visual_reid import select_diverse_crop_candidates  # noqa: E402
 from visual_grouping import VisualGroupRecord, group_records, reciprocal_groups  # noqa: E402
 
 
-def make_record(clip_id: str, vector: list[float]) -> GalleryRecord:
+def make_record(clip_id: str, vector: list[float], cam_label: str = "tapo_1") -> GalleryRecord:
+    cam_number = "".join(ch for ch in str(cam_label) if ch.isdigit()) or "1"
     return GalleryRecord(
         clip_id=clip_id,
         clip_path=f"/tmp/{clip_id}.mp4",
         best_frame_path=f"/tmp/{clip_id}.jpg",
-        cam_id="cam_1",
-        cam_label="tapo_1",
+        cam_id=f"cam_{cam_number}",
+        cam_label=cam_label,
         event_id=clip_id,
         track_id=1,
         created_at=1.0,
@@ -123,6 +124,103 @@ def test_gallery_ranking() -> None:
         assert results[1]["fallback"] is True
 
 
+def unit_vector_for_score(score: float) -> list[float]:
+    clamped = max(-1.0, min(1.0, float(score)))
+    return [clamped, float(np.sqrt(max(0.0, 1.0 - (clamped * clamped))))]
+
+
+def test_camera_covered_ranking_slot_order() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        gallery = LiveTopKGallery(Path(tmp_dir))
+        scores = {
+            "tapo_1_a": (0.99, "tapo_1"),
+            "tapo_1_b": (0.96, "tapo_1"),
+            "tapo_2": (0.72, "tapo_2"),
+            "tapo_3": (0.73, "tapo_3"),
+            "tapo_4": (0.74, "tapo_4"),
+            "tapo_5_a": (0.95, "tapo_5"),
+            "tapo_5_b": (0.94, "tapo_5"),
+            "tapo_6": (0.76, "tapo_6"),
+            "tapo_7": (0.77, "tapo_7"),
+            "tapo_8_a": (0.93, "tapo_8"),
+            "tapo_8_b": (0.92, "tapo_8"),
+            "tapo_9": (0.79, "tapo_9"),
+        }
+        for clip_id, (score, cam_label) in scores.items():
+            assert gallery.add_record(make_record(clip_id, unit_vector_for_score(score), cam_label=cam_label))
+
+        results, metadata = gallery.rank_with_metadata(
+            normalize_vector(np.asarray([1.0, 0.0])),
+            k=12,
+            candidate_pool=60,
+            fallback_score=0.55,
+            selection_mode="camera-covered",
+            coverage_cam_labels=[f"tapo_{index}" for index in range(1, 10)],
+        )
+        assert [item["rank"] for item in results] == list(range(1, 13))
+        assert [item["clip_id"] for item in results] == [
+            "tapo_1_a",
+            "tapo_2",
+            "tapo_3",
+            "tapo_1_b",
+            "tapo_4",
+            "tapo_5_a",
+            "tapo_6",
+            "tapo_5_b",
+            "tapo_7",
+            "tapo_8_a",
+            "tapo_9",
+            "tapo_8_b",
+        ]
+        assert [item["slot_type"] for item in results] == [
+            "required_camera",
+            "required_camera",
+            "required_camera",
+            "extra_duplicate",
+            "required_camera",
+            "required_camera",
+            "required_camera",
+            "extra_duplicate",
+            "required_camera",
+            "required_camera",
+            "required_camera",
+            "extra_duplicate",
+        ]
+        assert metadata["missing_cam_labels"] == []
+        assert metadata["coverage_slot_map"][3]["slot_type"] == "extra_duplicate"
+
+
+def test_camera_covered_ranking_fallback_preserves_available_camera_slots() -> None:
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        gallery = LiveTopKGallery(Path(tmp_dir))
+        assert gallery.add_record(make_record("cam1_required", unit_vector_for_score(0.91), cam_label="tapo_1"))
+        assert gallery.add_record(make_record("cam1_extra", unit_vector_for_score(0.90), cam_label="tapo_1"))
+        assert gallery.add_record(make_record("cam3_required", unit_vector_for_score(0.89), cam_label="tapo_3"))
+        assert gallery.add_record(make_record("cam4_required", unit_vector_for_score(0.88), cam_label="tapo_4"))
+
+        results, metadata = gallery.rank_with_metadata(
+            normalize_vector(np.asarray([1.0, 0.0])),
+            k=4,
+            candidate_pool=60,
+            fallback_score=0.55,
+            selection_mode="camera-covered",
+            coverage_cam_labels=["tapo_1", "tapo_2", "tapo_3"],
+        )
+        assert [item["clip_id"] for item in results] == [
+            "cam1_required",
+            "cam1_extra",
+            "cam3_required",
+            "cam4_required",
+        ]
+        assert results[1]["slot_type"] == "coverage_fallback"
+        assert results[1]["coverage_fallback"] is True
+        assert results[1]["intended_cam_label"] == "tapo_2"
+        assert results[1]["actual_cam_label"] == "tapo_1"
+        assert results[2]["slot_type"] == "required_camera"
+        assert results[2]["actual_cam_label"] == "tapo_3"
+        assert metadata["missing_cam_labels"] == ["tapo_2"]
+
+
 def test_similarity_grouping() -> None:
     with tempfile.TemporaryDirectory() as tmp_dir:
         gallery = LiveTopKGallery(Path(tmp_dir))
@@ -176,6 +274,10 @@ def test_topk_payload_shape() -> None:
             "best_frame_path": "/tmp/clip_a.jpg",
             "fallback": False,
             "quality": 0.8,
+            "slot_type": "required_camera",
+            "intended_cam_label": "tapo_1",
+            "actual_cam_label": "tapo_1",
+            "coverage_fallback": False,
         }
     ]
     flat, structured = build_topk_payload(
@@ -195,6 +297,10 @@ def test_topk_payload_shape() -> None:
     assert structured["cam_label"] == "macbook_query"
     assert structured["results"][0]["clip_id"] == "clip_a"
     assert structured["results"][0]["cam_label"] == "tapo_1"
+    assert structured["results"][0]["slot_type"] == "required_camera"
+    assert structured["results"][0]["intended_cam_label"] == "tapo_1"
+    assert structured["results"][0]["actual_cam_label"] == "tapo_1"
+    assert structured["results"][0]["coverage_fallback"] is False
 
 
 def test_export_helpers() -> None:
@@ -732,6 +838,8 @@ def main() -> int:
     test_source_parsing()
     test_tracker_config_resolution()
     test_gallery_ranking()
+    test_camera_covered_ranking_slot_order()
+    test_camera_covered_ranking_fallback_preserves_available_camera_slots()
     test_similarity_grouping()
     test_visual_grouping_connected_chain()
     test_visual_grouping_reciprocal_filter()

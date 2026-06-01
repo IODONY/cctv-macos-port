@@ -59,8 +59,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--crop-diversity-min-frame-gap", type=int, default=15)
     parser.add_argument("--crop-diversity-max-similarity", type=float, default=0.92)
     parser.add_argument("--crop-min-quality-ratio", type=float, default=0.70)
-    parser.add_argument("--topk", type=int, default=7)
-    parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument("--topk", type=int, default=12)
+    parser.add_argument("--candidate-pool", type=int, default=60)
+    parser.add_argument("--topk-selection-mode", choices=("score", "camera-covered"), default="camera-covered")
+    parser.add_argument(
+        "--coverage-cam-labels",
+        default="tapo_1,tapo_2,tapo_3,tapo_4,tapo_5,tapo_6,tapo_7,tapo_8,tapo_9",
+        help="Comma-separated gallery labels that should each occupy one fixed Top-K slot.",
+    )
     parser.add_argument("--frame-width", type=int, default=1280)
     parser.add_argument("--frame-height", type=int, default=720)
     parser.add_argument("--recording-fps", type=float, default=25.0)
@@ -260,6 +266,10 @@ def main() -> int:
         str(max(1, int(args.topk))),
         "--candidate-pool",
         str(max(1, int(args.candidate_pool))),
+        "--topk-selection-mode",
+        args.topk_selection_mode,
+        "--coverage-cam-labels",
+        args.coverage_cam_labels,
         "--frame-width",
         str(args.frame_width),
         "--frame-height",

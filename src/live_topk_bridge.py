@@ -48,6 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_CACHE_ROOT = PROJECT_ROOT / "logs" / "model_cache" / "torch"
 GALLERY_TYPES = {"A", "B", "G"}
 QUERY_TYPES = {"C", "Q"}
+DEFAULT_COVERAGE_CAM_LABELS = [f"tapo_{index}" for index in range(1, 10)]
 PREVIEW_LOCK = threading.Lock()
 PREVIEW_QUEUE: queue.Queue[tuple[str, np.ndarray, float]] = queue.Queue(maxsize=12)
 PREVIEW_DISABLED = False
@@ -399,8 +400,22 @@ def parse_args() -> argparse.Namespace:
         help="Maximum exponential backoff delay after a camera open failure.",
     )
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
-    parser.add_argument("--topk", type=int, default=7)
-    parser.add_argument("--candidate-pool", type=int, default=12)
+    parser.add_argument("--topk", type=int, default=12)
+    parser.add_argument("--candidate-pool", type=int, default=60)
+    parser.add_argument(
+        "--topk-selection-mode",
+        choices=("score", "camera-covered"),
+        default="camera-covered",
+        help="Use pure score order or reserve fixed slots for required camera angles before extra duplicate scenes.",
+    )
+    parser.add_argument(
+        "--coverage-cam-labels",
+        default=",".join(DEFAULT_COVERAGE_CAM_LABELS),
+        help=(
+            "Comma-separated gallery camera labels that should each appear once in camera-covered Top-K. "
+            "Default is tapo_1..tapo_9."
+        ),
+    )
     parser.add_argument(
         "--live-visual-top-n",
         type=int,
@@ -1366,7 +1381,56 @@ class LiveTopKGallery:
                 "count": count,
             }
 
-    def rank(self, query_embedding: np.ndarray | None, k: int, candidate_pool: int, fallback_score: float):
+    @staticmethod
+    def _result_from_record(
+        rank: int,
+        score: float,
+        record: GalleryRecord,
+        fallback_score: float,
+        slot_type: str = "score",
+        intended_cam_label: str = "",
+    ) -> dict[str, object]:
+        actual_cam_label = str(record.cam_label)
+        return {
+            "rank": int(rank),
+            "clip_id": record.clip_id,
+            "clip_path": record.clip_path,
+            "best_frame_path": record.best_frame_path,
+            "score": float(score),
+            "cam_id": record.cam_id,
+            "cam_label": actual_cam_label,
+            "event_id": record.event_id,
+            "track_id": record.track_id,
+            "fallback": bool(score < fallback_score),
+            "quality": record.quality,
+            "embedding_aggregation": record.embedding_aggregation,
+            "prototype_score_mode": record.prototype_score_mode,
+            "prototype_count": int(record.prototype_count or 0),
+            "slot_type": str(slot_type or "score"),
+            "intended_cam_label": str(intended_cam_label or actual_cam_label),
+            "actual_cam_label": actual_cam_label,
+            "coverage_fallback": str(slot_type or "") == "coverage_fallback",
+        }
+
+    @staticmethod
+    def _coverage_slot_specs(coverage_cam_labels: list[str], k: int) -> list[dict[str, object]]:
+        labels = [sanitize_id(label) for label in coverage_cam_labels if str(label or "").strip()]
+        specs: list[dict[str, object]] = []
+        extra_index = 0
+        for start in range(0, len(labels), 3):
+            for label in labels[start : start + 3]:
+                if len(specs) >= k:
+                    return specs
+                specs.append({"slot_type": "required_camera", "intended_cam_label": label})
+            if len(specs) < k:
+                extra_index += 1
+                specs.append({"slot_type": "extra_duplicate", "extra_index": extra_index})
+        while len(specs) < k:
+            extra_index += 1
+            specs.append({"slot_type": "extra_duplicate", "extra_index": extra_index})
+        return specs[:k]
+
+    def _score_records(self, query_embedding: np.ndarray | None) -> list[tuple[float, GalleryRecord]]:
         query = normalize_vector(query_embedding)
         if query is None:
             return []
@@ -1375,7 +1439,7 @@ class LiveTopKGallery:
         if not records:
             return []
 
-        scored = []
+        scored: list[tuple[float, GalleryRecord]] = []
         for record in records:
             score = prototype_similarity(
                 query,
@@ -1385,29 +1449,147 @@ class LiveTopKGallery:
             )
             scored.append((score, record))
         scored.sort(key=lambda item: item[0], reverse=True)
+        return scored
 
+    def rank(
+        self,
+        query_embedding: np.ndarray | None,
+        k: int,
+        candidate_pool: int,
+        fallback_score: float,
+        selection_mode: str = "score",
+        coverage_cam_labels: list[str] | None = None,
+    ):
+        results, _metadata = self.rank_with_metadata(
+            query_embedding,
+            k,
+            candidate_pool,
+            fallback_score,
+            selection_mode=selection_mode,
+            coverage_cam_labels=coverage_cam_labels,
+        )
+        return results
+
+    def rank_with_metadata(
+        self,
+        query_embedding: np.ndarray | None,
+        k: int,
+        candidate_pool: int,
+        fallback_score: float,
+        selection_mode: str = "score",
+        coverage_cam_labels: list[str] | None = None,
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        scored = self._score_records(query_embedding)
+        normalized_mode = str(selection_mode or "score").strip().lower()
+        if normalized_mode != "camera-covered":
+            return self._rank_by_score(scored, k, candidate_pool, fallback_score), {
+                "topk_selection_mode": "score",
+                "coverage_cam_labels": [],
+                "missing_cam_labels": [],
+                "coverage_slot_map": [],
+            }
+
+        labels = [sanitize_id(label) for label in (coverage_cam_labels or []) if str(label or "").strip()]
+        return self._rank_camera_covered(scored, k, fallback_score, labels)
+
+    def _rank_by_score(
+        self,
+        scored: list[tuple[float, GalleryRecord]],
+        k: int,
+        candidate_pool: int,
+        fallback_score: float,
+    ) -> list[dict[str, object]]:
         limit = min(max(k, candidate_pool), len(scored))
         results = []
         for rank, (score, record) in enumerate(scored[:limit], start=1):
-            results.append(
+            results.append(self._result_from_record(rank, score, record, fallback_score))
+        return results[:k]
+
+    def _rank_camera_covered(
+        self,
+        scored: list[tuple[float, GalleryRecord]],
+        k: int,
+        fallback_score: float,
+        coverage_cam_labels: list[str],
+    ) -> tuple[list[dict[str, object]], dict[str, object]]:
+        labels = coverage_cam_labels or list(DEFAULT_COVERAGE_CAM_LABELS)
+        slot_specs = self._coverage_slot_specs(labels, max(1, int(k)))
+        active_labels = [
+            str(spec.get("intended_cam_label"))
+            for spec in slot_specs
+            if str(spec.get("slot_type") or "") == "required_camera" and str(spec.get("intended_cam_label") or "")
+        ]
+        by_label: dict[str, list[tuple[float, GalleryRecord]]] = {}
+        for score, record in scored:
+            by_label.setdefault(str(record.cam_label), []).append((score, record))
+
+        selected_clip_ids: set[str] = set()
+        required_selection: dict[str, tuple[float, GalleryRecord]] = {}
+        missing_cam_labels: list[str] = []
+        for label in active_labels:
+            candidates = by_label.get(label, [])
+            if candidates:
+                score, record = candidates[0]
+                required_selection[label] = (score, record)
+                selected_clip_ids.add(record.clip_id)
+            else:
+                missing_cam_labels.append(label)
+
+        def next_unselected() -> tuple[float, GalleryRecord] | None:
+            for score, record in scored:
+                if record.clip_id in selected_clip_ids:
+                    continue
+                selected_clip_ids.add(record.clip_id)
+                return score, record
+            return None
+
+        results: list[dict[str, object]] = []
+        slot_map: list[dict[str, object]] = []
+        for rank, spec in enumerate(slot_specs, start=1):
+            slot_type = str(spec.get("slot_type") or "extra_duplicate")
+            intended_label = str(spec.get("intended_cam_label") or "")
+            selected: tuple[float, GalleryRecord] | None = None
+            output_slot_type = slot_type
+            if slot_type == "required_camera":
+                selected = required_selection.get(intended_label)
+                if selected is None:
+                    selected = next_unselected()
+                    output_slot_type = "coverage_fallback"
+            else:
+                selected = next_unselected()
+                output_slot_type = "extra_duplicate"
+
+            slot_payload = {
+                "rank": int(rank),
+                "slot_type": output_slot_type,
+                "intended_cam_label": intended_label,
+                "actual_cam_label": "",
+                "clip_id": "",
+                "score": 0.0,
+            }
+            if selected is None:
+                slot_map.append(slot_payload)
+                continue
+
+            score, record = selected
+            result = self._result_from_record(rank, score, record, fallback_score, output_slot_type, intended_label)
+            results.append(result)
+            slot_payload.update(
                 {
-                    "rank": rank,
-                    "clip_id": record.clip_id,
-                    "clip_path": record.clip_path,
-                    "best_frame_path": record.best_frame_path,
-                    "score": score,
-                    "cam_id": record.cam_id,
-                    "cam_label": record.cam_label,
-                    "event_id": record.event_id,
-                    "track_id": record.track_id,
-                    "fallback": bool(score < fallback_score),
-                    "quality": record.quality,
-                    "embedding_aggregation": record.embedding_aggregation,
-                    "prototype_score_mode": record.prototype_score_mode,
-                    "prototype_count": int(record.prototype_count or 0),
+                    "actual_cam_label": str(record.cam_label),
+                    "clip_id": str(record.clip_id),
+                    "score": round(float(score), 6),
                 }
             )
-        return results[:k]
+            slot_map.append(slot_payload)
+
+        metadata = {
+            "topk_selection_mode": "camera-covered",
+            "coverage_cam_labels": list(labels),
+            "missing_cam_labels": list(missing_cam_labels),
+            "coverage_slot_map": slot_map,
+        }
+        return results, metadata
 
     def log_query(self, payload: dict[str, object]) -> None:
         self._append_jsonl(self.query_log_path, payload)
@@ -1981,6 +2163,10 @@ def build_topk_payload(
                 "fallback": bool(result.get("fallback", False)),
                 "quality": round(float(result.get("quality", 0.0)), 4),
                 "embedding_aggregation": str(result.get("embedding_aggregation", "")),
+                "slot_type": str(result.get("slot_type", "score")),
+                "intended_cam_label": str(result.get("intended_cam_label", "")),
+                "actual_cam_label": str(result.get("actual_cam_label", result.get("cam_label", ""))),
+                "coverage_fallback": bool(result.get("coverage_fallback", False)),
             }
         )
 
@@ -2859,11 +3045,13 @@ class LiveTopKCameraContext:
         target = self._select_query_target(people, frame.shape[1], frame.shape[0])
         crop = visual_crop_person(frame, target["box"])
         embedding, method = self.embedder.embed_bgr(crop)
-        results = self.gallery.rank(
+        results, topk_metadata = self.gallery.rank_with_metadata(
             embedding,
             k=max(1, int(self.args.topk)),
             candidate_pool=max(1, int(self.args.candidate_pool)),
             fallback_score=float(self.args.fallback_score),
+            selection_mode=str(self.args.topk_selection_mode),
+            coverage_cam_labels=split_csv(str(self.args.coverage_cam_labels or "")),
         )
 
         query_track_id = int(target.get("track_id", 0))
@@ -2876,6 +3064,7 @@ class LiveTopKCameraContext:
             self.gallery.count(),
             results,
         )
+        structured_payload.update(topk_metadata)
         structured_payload["embedding_method"] = method
         structured_payload["query_quality"] = round(visual_crop_quality(crop, target, frame.shape), 4)
         structured_payload["tracker_backend"] = str(self.args.tracker_backend)
@@ -2915,13 +3104,19 @@ class LiveTopKCameraContext:
             path = "" if result is None else str(result["clip_path"])
             score = 0.0 if result is None else float(result["score"])
             cam_label = "" if result is None else str(result.get("cam_label", ""))
+            slot_type = "" if result is None else str(result.get("slot_type", ""))
+            intended_cam_label = "" if result is None else str(result.get("intended_cam_label", ""))
+            actual_cam_label = "" if result is None else str(result.get("actual_cam_label", cam_label))
             self.osc.send(f"{base}/result/{rank}/path", path)
             self.osc.send(f"{base}/result/{rank}/score", score)
             self.osc.send(f"{base}/result/{rank}/cam_label", cam_label)
+            self.osc.send(f"{base}/result/{rank}/slot_type", slot_type)
+            self.osc.send(f"{base}/result/{rank}/intended_cam_label", intended_cam_label)
+            self.osc.send(f"{base}/result/{rank}/actual_cam_label", actual_cam_label)
         print(
             f"[cam {self.cam_id} {self.cam_label}] TopK query={structured_payload['query_id']} "
             f"results={structured_payload['result_count']}/{self.args.topk} "
-            f"gallery={structured_payload['gallery_count']}"
+            f"gallery={structured_payload['gallery_count']} mode={structured_payload.get('topk_selection_mode', 'score')}"
         )
 
     def _send_status(self, people: list[dict[str, object]]) -> None:
@@ -3321,6 +3516,11 @@ def main() -> int:
         f"merge_method={args.merge_method} "
         f"merge_threshold={args.merge_threshold} "
         f"merge_reciprocal_topn={args.merge_reciprocal_topn}"
+    )
+    print(
+        f"Top-K selection: mode={args.topk_selection_mode} "
+        f"k={args.topk} candidate_pool={args.candidate_pool} "
+        f"coverage_cam_labels={','.join(split_csv(args.coverage_cam_labels)) or 'none'}"
     )
     if args.export_topk_dir:
         print(f"Top-K export root: {resolve_project_path(args.export_topk_dir)} mode={args.export_mode}")

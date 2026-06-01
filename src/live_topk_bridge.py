@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -109,6 +110,30 @@ def parse_args() -> argparse.Namespace:
         default=25.0,
         help="FPS written into recorded mp4 files. Default is 25fps for exhibition playback.",
     )
+    parser.add_argument(
+        "--recording-stale-frame-seconds",
+        type=float,
+        default=1.0,
+        help="During active recording, reuse the latest captured frame only while it is newer than this age.",
+    )
+    parser.add_argument(
+        "--recording-reconnect-grace-seconds",
+        type=float,
+        default=3.0,
+        help="Keep active recorders open this long while capture is stale, so short RTSP reconnects do not split clips.",
+    )
+    parser.add_argument(
+        "--min-recorded-frames",
+        type=int,
+        default=0,
+        help="Minimum written frames before gallery registration. 0 derives it from --min-clip-seconds and --recording-fps.",
+    )
+    parser.add_argument(
+        "--min-unique-frames",
+        type=int,
+        default=5,
+        help="Minimum distinct source frames before gallery registration, preventing duplicated-frame clips from entering ReID.",
+    )
     parser.add_argument("--show-preview", action="store_true", help="Show live annotated camera preview windows.")
     parser.add_argument(
         "--preview-scale",
@@ -199,6 +224,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reconnect-delay", type=float, default=2.0)
     parser.add_argument("--max-read-failures", type=int, default=10)
+    parser.add_argument(
+        "--rtsp-open-timeout-ms",
+        type=int,
+        default=5000,
+        help="OpenCV/FFmpeg RTSP open timeout. Lower values keep failed cameras from starving recorder threads.",
+    )
+    parser.add_argument(
+        "--rtsp-read-timeout-ms",
+        type=int,
+        default=5000,
+        help="OpenCV/FFmpeg RTSP read timeout.",
+    )
+    parser.add_argument(
+        "--max-open-retry-delay",
+        type=float,
+        default=30.0,
+        help="Maximum exponential backoff delay after a camera open failure.",
+    )
     parser.add_argument("--query-interval-seconds", type=float, default=1.0)
     parser.add_argument("--topk", type=int, default=7)
     parser.add_argument("--candidate-pool", type=int, default=12)
@@ -372,6 +415,8 @@ def create_capture(
     frame_width: int,
     frame_height: int,
     requested_fps: float = 25.0,
+    open_timeout_ms: int = 5000,
+    read_timeout_ms: int = 5000,
 ) -> cv2.VideoCapture:
     source_info = parse_video_source(video_source)
     if source_info["kind"] == "webcam":
@@ -388,8 +433,21 @@ def create_capture(
             cap = cv2.VideoCapture(source_info["capture_source"])
         cap.set(cv2.CAP_PROP_FPS, max(1.0, float(requested_fps)))
     else:
-        cap = cv2.VideoCapture(source_info["capture_source"], cv2.CAP_FFMPEG)
-        if not cap.isOpened():
+        params = []
+        if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+            params.extend([cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, max(1000, int(open_timeout_ms))])
+        if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+            params.extend([cv2.CAP_PROP_READ_TIMEOUT_MSEC, max(1000, int(read_timeout_ms))])
+        try:
+            cap = cv2.VideoCapture(source_info["capture_source"], cv2.CAP_FFMPEG, params)
+        except cv2.error:
+            cap = cv2.VideoCapture()
+            if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, max(1000, int(open_timeout_ms)))
+            if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, max(1000, int(read_timeout_ms)))
+            cap.open(source_info["capture_source"], cv2.CAP_FFMPEG)
+        if not cap.isOpened() and source_info["kind"] != "rtsp":
             cap = cv2.VideoCapture(source_info["capture_source"])
 
     if cap.isOpened():
@@ -697,7 +755,11 @@ class GalleryRecord:
     frame_count: int
     writer_fps: float
     encoded_duration_seconds: float
+    unique_frame_count: int
+    duplicate_frame_count: int
+    max_frame_age_seconds: float
     embedding_method: str
+    recording_interrupted: bool = False
     embedding_aggregation: str = "single_best"
     tracker_backend: str = "custom"
     tracker_config_path: str = ""
@@ -733,6 +795,10 @@ class GalleryRecord:
             "frame_count": int(self.frame_count),
             "writer_fps": round(float(self.writer_fps), 3),
             "encoded_duration_seconds": round(float(self.encoded_duration_seconds), 3),
+            "unique_frame_count": int(self.unique_frame_count),
+            "duplicate_frame_count": int(self.duplicate_frame_count),
+            "max_frame_age_seconds": round(float(self.max_frame_age_seconds), 3),
+            "recording_interrupted": bool(self.recording_interrupted),
             "embedding_method": self.embedding_method,
             "embedding_aggregation": self.embedding_aggregation,
             "tracker_backend": self.tracker_backend,
@@ -926,6 +992,11 @@ class PersonClipRecorder:
         self.last_person: dict[str, object] | None = None
         self.missing_analyses = 0
         self.frame_count = 0
+        self.unique_frame_count = 0
+        self.duplicate_frame_count = 0
+        self.last_written_source_frame_index = 0
+        self.max_frame_age_seconds = 0.0
+        self.recording_interrupted = False
         self.best_crop = None
         self.best_quality = -1.0
         self.best_candidate_metadata: dict[str, object] | None = None
@@ -935,6 +1006,32 @@ class PersonClipRecorder:
             print(f"[gallery] Failed to open clip writer: {self.clip_path}")
         else:
             print(f"[gallery] Recording track {track_id} with {self.codec} {self.fps:.1f}fps: {self.clip_path}")
+
+    def discard_clip(self, reason: str, details: dict[str, object] | None = None) -> None:
+        if not self.clip_path.parent.exists():
+            return
+        discard_dir = self.clip_path.parent.parent / "_discarded" / self.cam_label
+        discard_dir.mkdir(parents=True, exist_ok=True)
+        moved_paths = []
+        for source in sorted(self.clip_path.parent.glob(f"{self.clip_id}*")):
+            destination = discard_dir / source.name
+            if destination.exists() or destination.is_symlink():
+                destination.unlink()
+            shutil.move(str(source), str(destination))
+            moved_paths.append(str(destination.resolve()).replace("\\", "/"))
+            if source == self.clip_path:
+                self.clip_path = destination
+        payload = {
+            "clip_id": self.clip_id,
+            "cam_id": self.cam_id,
+            "cam_label": self.cam_label,
+            "track_id": int(self.track_id),
+            "reason": str(reason),
+            "details": details or {},
+            "moved_paths": moved_paths,
+        }
+        write_json(discard_dir / f"{self.clip_id}_discard.json", payload)
+        print(f"[gallery] Moved invalid clip to _discarded reason={reason}: {self.clip_id}")
 
     def observe(self, frame: np.ndarray, person: dict[str, object], frame_index: int = 0) -> None:
         self.last_box = tuple(int(value) for value in person["box"])
@@ -979,7 +1076,12 @@ class PersonClipRecorder:
             return True
         return self.missing_analyses > max(1, int(track_missing_grace))
 
-    def write_frame(self, frame: np.ndarray) -> None:
+    def write_frame(
+        self,
+        frame: np.ndarray,
+        source_frame_index: int = 0,
+        frame_age_seconds: float = 0.0,
+    ) -> None:
         if self.writer is None or self.last_box is None or self.closed:
             return
         if self.record_video_mode == "person-crop":
@@ -990,6 +1092,16 @@ class PersonClipRecorder:
         else:
             self.writer.write(resize_frame_if_needed(frame, self.output_size))
         self.frame_count += 1
+        source_index = int(source_frame_index)
+        if source_index > 0 and source_index != self.last_written_source_frame_index:
+            self.unique_frame_count += 1
+            self.last_written_source_frame_index = source_index
+        else:
+            self.duplicate_frame_count += 1
+        self.max_frame_age_seconds = max(float(self.max_frame_age_seconds), max(0.0, float(frame_age_seconds)))
+
+    def mark_interrupted(self) -> None:
+        self.recording_interrupted = True
 
     def should_force_close(self, max_clip_seconds: float) -> bool:
         if max_clip_seconds <= 0:
@@ -1008,6 +1120,8 @@ class PersonClipRecorder:
         analyzed_fps: float = 0.0,
         dropped_frame_count: int = 0,
         post_roll_seconds: float = 0.0,
+        min_recorded_frames: int = 0,
+        min_unique_frames: int = 0,
     ) -> GalleryRecord | None:
         if self.closed:
             return None
@@ -1020,16 +1134,73 @@ class PersonClipRecorder:
 
         duration = time.monotonic() - self.started_at
         encoded_duration = float(self.frame_count) / max(1.0, float(self.fps))
+        required_frames = int(min_recorded_frames)
+        if required_frames <= 0:
+            required_frames = int(math.ceil(max(0.0, float(min_clip_seconds)) * max(1.0, float(self.fps))))
         if encoded_duration < max(0.0, float(min_clip_seconds)):
             print(
-                f"[gallery] Kept short clip on disk but skipped ReID gallery track {self.track_id}: "
+                f"[gallery] Skipped short ReID gallery track {self.track_id}: "
                 f"encoded_duration={encoded_duration:.2f}s wall_duration={duration:.2f}s "
                 f"frames={self.frame_count} fps={self.fps:.1f} min={float(min_clip_seconds):.2f}s reason={reason}"
+            )
+            self.discard_clip(
+                "short_encoded_duration",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "wall_duration_seconds": round(duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "writer_fps": round(float(self.fps), 3),
+                    "min_clip_seconds": round(float(min_clip_seconds), 3),
+                },
+            )
+            return None
+        if self.frame_count < required_frames:
+            print(
+                f"[gallery] Skipped low-frame ReID gallery track {self.track_id}: "
+                f"frames={self.frame_count} min_frames={required_frames} "
+                f"encoded_duration={encoded_duration:.2f}s reason={reason}"
+            )
+            self.discard_clip(
+                "low_recorded_frames",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "min_recorded_frames": int(required_frames),
+                },
+            )
+            return None
+        if self.unique_frame_count < max(0, int(min_unique_frames)):
+            print(
+                f"[gallery] Skipped duplicate-heavy ReID gallery track {self.track_id}: "
+                f"unique_frames={self.unique_frame_count} min_unique={int(min_unique_frames)} "
+                f"frames={self.frame_count} duplicates={self.duplicate_frame_count} reason={reason}"
+            )
+            self.discard_clip(
+                "low_unique_frames",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "unique_frame_count": int(self.unique_frame_count),
+                    "duplicate_frame_count": int(self.duplicate_frame_count),
+                    "min_unique_frames": int(min_unique_frames),
+                },
             )
             return None
 
         if self.best_crop is None:
             print(f"[gallery] Dropped empty track {self.track_id}: {reason}")
+            self.discard_clip(
+                "no_reid_crop",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "unique_frame_count": int(self.unique_frame_count),
+                },
+            )
             return None
 
         self.best_frame_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,6 +1242,15 @@ class PersonClipRecorder:
             embedding, method = embedder.embed_bgr(self.best_crop)
         if embedding is None:
             print(f"[gallery] No embedding for track {self.track_id}: {self.clip_path}")
+            self.discard_clip(
+                "embedding_failed",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "unique_frame_count": int(self.unique_frame_count),
+                },
+            )
             return None
 
         best_metadata = top_crop_metadata[0] if top_crop_metadata else (self.best_candidate_metadata or {})
@@ -1089,7 +1269,11 @@ class PersonClipRecorder:
             frame_count=self.frame_count,
             writer_fps=self.fps,
             encoded_duration_seconds=encoded_duration,
+            unique_frame_count=self.unique_frame_count,
+            duplicate_frame_count=self.duplicate_frame_count,
+            max_frame_age_seconds=self.max_frame_age_seconds,
             embedding_method=method,
+            recording_interrupted=self.recording_interrupted,
             embedding_aggregation=f"mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
             tracker_backend=str(tracker_backend),
             tracker_config_path=str(tracker_config_path),
@@ -1275,6 +1459,12 @@ class LiveTopKCameraContext:
             self.last_analyzed_source_frame_index = self.latest_frame_index
             return self.latest_frame, self.latest_frame_index, self.latest_captured_at
 
+    def latest_frame_snapshot(self) -> tuple[np.ndarray, int, float] | None:
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None
+            return self.latest_frame, int(self.latest_frame_index), float(self.latest_captured_at)
+
     def analyzed_fps(self) -> float:
         elapsed = time.monotonic() - self.started_at
         if elapsed <= 0:
@@ -1311,6 +1501,7 @@ class LiveTopKCameraContext:
             f"label={self.cam_label} source={self.source_info['display']}"
         )
         started = time.monotonic()
+        open_failures = 0
         while not self.stop_event.is_set():
             if self.args.max_runtime_seconds > 0 and time.monotonic() - started >= self.args.max_runtime_seconds:
                 self.stop_event.set()
@@ -1321,11 +1512,19 @@ class LiveTopKCameraContext:
                 self.args.frame_width,
                 self.args.frame_height,
                 float(self.args.recording_fps),
+                int(self.args.rtsp_open_timeout_ms),
+                int(self.args.rtsp_read_timeout_ms),
             )
             if not cap.isOpened():
-                print(f"[cam {self.cam_id}] Failed to open {self.source_info['display']}; retrying.")
-                time.sleep(self.args.reconnect_delay)
+                open_failures += 1
+                retry_delay = self._open_retry_delay(open_failures)
+                print(
+                    f"[cam {self.cam_id}] Failed to open {self.source_info['display']}; "
+                    f"retrying in {retry_delay:.1f}s."
+                )
+                time.sleep(retry_delay)
                 continue
+            open_failures = 0
 
             try:
                 self._capture_loop(cap, started)
@@ -1369,19 +1568,55 @@ class LiveTopKCameraContext:
 
             if self.analyzed_frames % max(1, self.args.print_interval_frames) == 0:
                 print(
-                    f"[cam {self.cam_id}] role={self.cam_type} people={len(people)} "
-                    f"gallery={self.gallery.count()} inference_ms={self.analyzer.last_inference_ms:.1f}"
+                f"[cam {self.cam_id}] role={self.cam_type} people={len(people)} "
+                f"gallery={self.gallery.count()} inference_ms={self.analyzer.last_inference_ms:.1f}"
                 )
+
+    def _open_retry_delay(self, open_failures: int) -> float:
+        base = max(0.1, float(self.args.reconnect_delay))
+        cap = max(base, float(self.args.max_open_retry_delay))
+        return min(cap, base * (2 ** min(4, max(0, int(open_failures) - 1))))
 
     def _write_active_recorders(self, frame: np.ndarray) -> None:
         force_close_track_ids = []
         with self.recorder_lock:
             for recorder in list(self.recorders.values()):
-                recorder.write_frame(frame)
+                recorder.write_frame(frame, self.frame_index, 0.0)
                 if recorder.should_force_close(self.args.max_clip_seconds):
                     force_close_track_ids.append(recorder.track_id)
         for track_id in force_close_track_ids:
             self._finalize_recorder(track_id, "max_clip_seconds")
+
+    def write_recording_tick(self) -> None:
+        snapshot = self.latest_frame_snapshot()
+        if snapshot is None:
+            return
+
+        frame, source_frame_index, captured_at = snapshot
+        now = time.monotonic()
+        frame_age = max(0.0, now - float(captured_at))
+        stale_limit = max(0.0, float(self.args.recording_stale_frame_seconds))
+        reconnect_grace = max(stale_limit, float(self.args.recording_reconnect_grace_seconds))
+        close_track_ids: list[tuple[int, str]] = []
+
+        with self.recorder_lock:
+            recorders = list(self.recorders.values())
+            if frame_age > reconnect_grace:
+                for recorder in recorders:
+                    recorder.mark_interrupted()
+                    close_track_ids.append((recorder.track_id, "recording_input_stale"))
+            elif frame_age <= stale_limit:
+                for recorder in recorders:
+                    recorder.write_frame(frame, source_frame_index, frame_age)
+                    if recorder.should_force_close(self.args.max_clip_seconds):
+                        close_track_ids.append((recorder.track_id, "max_clip_seconds"))
+            else:
+                for recorder in recorders:
+                    if recorder.should_force_close(self.args.max_clip_seconds):
+                        close_track_ids.append((recorder.track_id, "max_clip_seconds"))
+
+        for track_id, reason in close_track_ids:
+            self._finalize_recorder(track_id, reason)
 
     def _handle_gallery_people(
         self,
@@ -1598,6 +1833,8 @@ class LiveTopKCameraContext:
             analyzed_fps=float(self.analyzed_fps()),
             dropped_frame_count=int(self.dropped_frame_count),
             post_roll_seconds=float(self.args.post_roll_seconds),
+            min_recorded_frames=int(self.args.min_recorded_frames),
+            min_unique_frames=int(self.args.min_unique_frames),
         )
         if record is None:
             return
@@ -1644,7 +1881,8 @@ class LiveTopKCameraContext:
         self.osc.send(f"/walnut/live_gallery/cam/{self.cam_id}/last/cam_label", record.cam_label)
         print(
             f"[gallery] Added {record.clip_id} cam={record.cam_id} label={record.cam_label} "
-            f"quality={record.quality:.3f} frames={record.frame_count}"
+            f"quality={record.quality:.3f} frames={record.frame_count} unique={record.unique_frame_count} "
+            f"encoded={record.encoded_duration_seconds:.2f}s"
             + (
                 f" group={record.similarity_group_label} group_score={record.similarity_group_score:.3f}"
                 if record.similarity_group_label
@@ -1677,6 +1915,7 @@ class CaptureWorker(threading.Thread):
             f"[cam {context.cam_id}] Starting capture worker role={context.cam_type} "
             f"label={context.cam_label} source={context.source_info['display']}"
         )
+        open_failures = 0
         while not self.stop_event.is_set():
             if self._runtime_expired():
                 self.stop_event.set()
@@ -1687,17 +1926,24 @@ class CaptureWorker(threading.Thread):
                 context.args.frame_width,
                 context.args.frame_height,
                 float(context.args.recording_fps),
+                int(context.args.rtsp_open_timeout_ms),
+                int(context.args.rtsp_read_timeout_ms),
             )
             if not cap.isOpened():
-                print(f"[cam {context.cam_id}] Failed to open {context.source_info['display']}; retrying.")
-                time.sleep(context.args.reconnect_delay)
+                open_failures += 1
+                retry_delay = self._open_retry_delay(open_failures)
+                print(
+                    f"[cam {context.cam_id}] Failed to open {context.source_info['display']}; "
+                    f"retrying in {retry_delay:.1f}s."
+                )
+                time.sleep(retry_delay)
                 continue
+            open_failures = 0
 
             try:
                 self._capture_loop(cap)
             finally:
                 cap.release()
-                context._close_all_recorders("capture_closed")
 
             if not self.stop_event.is_set():
                 time.sleep(context.args.reconnect_delay)
@@ -1705,6 +1951,11 @@ class CaptureWorker(threading.Thread):
     def _runtime_expired(self) -> bool:
         max_runtime = float(self.context.args.max_runtime_seconds)
         return max_runtime > 0 and time.monotonic() - self.started_at >= max_runtime
+
+    def _open_retry_delay(self, open_failures: int) -> float:
+        base = max(0.1, float(self.context.args.reconnect_delay))
+        cap = max(base, float(self.context.args.max_open_retry_delay))
+        return min(cap, base * (2 ** min(4, max(0, int(open_failures) - 1))))
 
     def _capture_loop(self, cap: cv2.VideoCapture) -> None:
         context = self.context
@@ -1726,7 +1977,40 @@ class CaptureWorker(threading.Thread):
             context.frame_index += 1
             captured_at = time.monotonic()
             context.update_latest_frame(frame, context.frame_index, captured_at)
-            context._write_active_recorders(frame)
+
+
+class RecordingWorker(threading.Thread):
+    def __init__(
+        self,
+        context: LiveTopKCameraContext,
+        stop_event: threading.Event,
+        started_at: float,
+    ):
+        super().__init__(daemon=True)
+        self.context = context
+        self.stop_event = stop_event
+        self.started_at = started_at
+
+    def run(self) -> None:
+        context = self.context
+        fps = max(1.0, float(context.args.recording_fps))
+        interval = 1.0 / fps
+        next_tick = time.monotonic()
+        print(f"[cam {context.cam_id}] Starting recording worker label={context.cam_label} fps={fps:.1f}")
+        while not self.stop_event.is_set():
+            if self._runtime_expired():
+                self.stop_event.set()
+                break
+            now = time.monotonic()
+            if now < next_tick:
+                time.sleep(min(0.02, next_tick - now))
+                continue
+            context.write_recording_tick()
+            next_tick = max(next_tick + interval, time.monotonic())
+
+    def _runtime_expired(self) -> bool:
+        max_runtime = float(self.context.args.max_runtime_seconds)
+        return max_runtime > 0 and time.monotonic() - self.started_at >= max_runtime
 
 
 class InferenceCoordinator(threading.Thread):
@@ -1798,7 +2082,11 @@ def main() -> int:
         f"tracker_with_reid={tracker_with_reid} "
         f"inference_interval={args.inference_interval} "
         f"post_roll_seconds={args.post_roll_seconds} "
-        f"min_clip_seconds={args.min_clip_seconds}"
+        f"min_clip_seconds={args.min_clip_seconds} "
+        f"min_recorded_frames={args.min_recorded_frames} "
+        f"min_unique_frames={args.min_unique_frames} "
+        f"stale_frame_seconds={args.recording_stale_frame_seconds} "
+        f"reconnect_grace_seconds={args.recording_reconnect_grace_seconds}"
     )
     print(f"Embedding model: {args.embedding_model} method={embedder.method} device={embedder.device}")
     if args.show_preview:
@@ -1836,9 +2124,12 @@ def main() -> int:
 
     started_at = time.monotonic()
     capture_workers = [CaptureWorker(context, stop_event, started_at) for context in contexts]
+    recording_workers = [RecordingWorker(context, stop_event, started_at) for context in contexts]
     inference_worker = InferenceCoordinator(contexts, args, stop_event, started_at)
 
     for worker in capture_workers:
+        worker.start()
+    for worker in recording_workers:
         worker.start()
     inference_worker.start()
 
@@ -1855,7 +2146,11 @@ def main() -> int:
         stop_event.set()
         for worker in capture_workers:
             worker.join(timeout=5.0)
+        for worker in recording_workers:
+            worker.join(timeout=5.0)
         inference_worker.join(timeout=5.0)
+        for context in contexts:
+            context._close_all_recorders("shutdown")
         if args.show_preview:
             with PREVIEW_LOCK:
                 cv2.destroyAllWindows()

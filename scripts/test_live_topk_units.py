@@ -55,6 +55,9 @@ def make_record(clip_id: str, vector: list[float]) -> GalleryRecord:
         frame_count=10,
         writer_fps=25.0,
         encoded_duration_seconds=0.4,
+        unique_frame_count=10,
+        duplicate_frame_count=0,
+        max_frame_age_seconds=0.0,
         embedding_method="unit",
     )
 
@@ -257,7 +260,7 @@ def test_person_clip_recorder_topn_embedding() -> None:
     for index in range(5):
         frame = np.full((64, 64, 3), 30 + (index * 20), dtype=np.uint8)
         recorder.observe(frame, person, frame_index=index + 1)
-        recorder.write_frame(frame)
+        recorder.write_frame(frame, source_frame_index=index + 1, frame_age_seconds=0.02)
 
     record = recorder.close(
         UnitEmbedder(),
@@ -268,6 +271,8 @@ def test_person_clip_recorder_topn_embedding() -> None:
         analyzed_fps=5.0,
         dropped_frame_count=2,
         post_roll_seconds=2.0,
+        min_recorded_frames=0,
+        min_unique_frames=0,
     )
     assert record is not None
     assert record.cam_label == "tapo_1"
@@ -275,6 +280,8 @@ def test_person_clip_recorder_topn_embedding() -> None:
     assert "_t007_e" in record.clip_id
     assert record.writer_fps == 10.0
     assert record.encoded_duration_seconds == 0.5
+    assert record.unique_frame_count == 5
+    assert record.duplicate_frame_count == 0
     assert record.tracker_backend == "botsort"
     assert record.embedding_aggregation == "mean_top_3"
     assert len(record.top_crop_paths or []) == 3

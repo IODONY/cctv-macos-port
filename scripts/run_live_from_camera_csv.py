@@ -34,6 +34,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frame-width", type=int, default=1280)
     parser.add_argument("--frame-height", type=int, default=720)
     parser.add_argument("--recording-fps", type=float, default=25.0)
+    parser.add_argument("--recording-stale-frame-seconds", type=float, default=1.0)
+    parser.add_argument("--recording-reconnect-grace-seconds", type=float, default=3.0)
+    parser.add_argument("--min-recorded-frames", type=int, default=0)
+    parser.add_argument("--min-unique-frames", type=int, default=5)
+    parser.add_argument("--rtsp-open-timeout-ms", type=int, default=5000)
+    parser.add_argument("--rtsp-read-timeout-ms", type=int, default=5000)
+    parser.add_argument("--max-open-retry-delay", type=float, default=30.0)
     parser.add_argument("--embedding-model", default="osnet_x0_25")
     parser.add_argument("--record-video-mode", choices=("full-frame", "person-crop"), default="full-frame")
     parser.add_argument("--storage-layout", choices=("camera", "similarity"), default="similarity")
@@ -175,6 +182,20 @@ def main() -> int:
         str(args.frame_height),
         "--recording-fps",
         str(args.recording_fps),
+        "--recording-stale-frame-seconds",
+        str(args.recording_stale_frame_seconds),
+        "--recording-reconnect-grace-seconds",
+        str(args.recording_reconnect_grace_seconds),
+        "--min-recorded-frames",
+        str(args.min_recorded_frames),
+        "--min-unique-frames",
+        str(args.min_unique_frames),
+        "--rtsp-open-timeout-ms",
+        str(args.rtsp_open_timeout_ms),
+        "--rtsp-read-timeout-ms",
+        str(args.rtsp_read_timeout_ms),
+        "--max-open-retry-delay",
+        str(args.max_open_retry_delay),
         "--embedding-model",
         args.embedding_model,
         "--record-video-mode",

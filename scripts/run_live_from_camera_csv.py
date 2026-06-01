@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-pool", type=int, default=12)
     parser.add_argument("--frame-width", type=int, default=1280)
     parser.add_argument("--frame-height", type=int, default=720)
+    parser.add_argument("--recording-fps", type=float, default=25.0)
     parser.add_argument("--embedding-model", default="osnet_x0_25")
     parser.add_argument("--record-video-mode", choices=("full-frame", "person-crop"), default="full-frame")
     parser.add_argument("--storage-layout", choices=("camera", "similarity"), default="similarity")
@@ -172,6 +173,8 @@ def main() -> int:
         str(args.frame_width),
         "--frame-height",
         str(args.frame_height),
+        "--recording-fps",
+        str(args.recording_fps),
         "--embedding-model",
         args.embedding_model,
         "--record-video-mode",

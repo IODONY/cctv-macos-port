@@ -53,6 +53,8 @@ def make_record(clip_id: str, vector: list[float]) -> GalleryRecord:
         quality=0.9,
         duration_seconds=1.0,
         frame_count=10,
+        writer_fps=25.0,
+        encoded_duration_seconds=0.4,
         embedding_method="unit",
     )
 
@@ -271,6 +273,8 @@ def test_person_clip_recorder_topn_embedding() -> None:
     assert record.cam_label == "tapo_1"
     assert "_event_" not in record.clip_id
     assert "_t007_e" in record.clip_id
+    assert record.writer_fps == 10.0
+    assert record.encoded_duration_seconds == 0.5
     assert record.tracker_backend == "botsort"
     assert record.embedding_aggregation == "mean_top_3"
     assert len(record.top_crop_paths or []) == 3

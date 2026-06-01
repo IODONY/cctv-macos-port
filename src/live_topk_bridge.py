@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         default="full-frame",
         help="Record full original frames per track, or the older cropped person video.",
     )
+    parser.add_argument(
+        "--recording-fps",
+        type=float,
+        default=25.0,
+        help="FPS written into recorded mp4 files. Default is 25fps for exhibition playback.",
+    )
     parser.add_argument("--show-preview", action="store_true", help="Show live annotated camera preview windows.")
     parser.add_argument(
         "--preview-scale",
@@ -180,7 +186,10 @@ def parse_args() -> argparse.Namespace:
         "--min-clip-seconds",
         type=float,
         default=1.5,
-        help="Closed gallery clips shorter than this are kept on disk but not added to the ReID gallery.",
+        help=(
+            "Closed gallery clips with encoded playback duration shorter than this are kept on disk "
+            "but not added to the ReID gallery."
+        ),
     )
     parser.add_argument(
         "--max-clip-seconds",
@@ -358,7 +367,12 @@ def redact_source(source: str) -> str:
     return parsed._replace(netloc=netloc).geturl()
 
 
-def create_capture(video_source: str, frame_width: int, frame_height: int) -> cv2.VideoCapture:
+def create_capture(
+    video_source: str,
+    frame_width: int,
+    frame_height: int,
+    requested_fps: float = 25.0,
+) -> cv2.VideoCapture:
     source_info = parse_video_source(video_source)
     if source_info["kind"] == "webcam":
         if sys.platform == "darwin":
@@ -372,7 +386,7 @@ def create_capture(video_source: str, frame_width: int, frame_height: int) -> cv
         cap = cv2.VideoCapture(source_info["capture_source"], backend)
         if not cap.isOpened():
             cap = cv2.VideoCapture(source_info["capture_source"])
-        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_FPS, max(1.0, float(requested_fps)))
     else:
         cap = cv2.VideoCapture(source_info["capture_source"], cv2.CAP_FFMPEG)
         if not cap.isOpened():
@@ -385,13 +399,13 @@ def create_capture(video_source: str, frame_width: int, frame_height: int) -> cv
     return cap
 
 
-def preflight_webcams(sources: list[str], frame_width: int, frame_height: int) -> None:
+def preflight_webcams(sources: list[str], frame_width: int, frame_height: int, requested_fps: float) -> None:
     for source in sources:
         source_info = parse_video_source(source)
         if source_info["kind"] != "webcam":
             continue
         print(f"[preflight] Opening {source_info['display']} on main thread for camera authorization.")
-        cap = create_capture(source, frame_width, frame_height)
+        cap = create_capture(source, frame_width, frame_height, requested_fps)
         if not cap.isOpened():
             print(
                 f"[preflight] Could not open {source_info['display']}. "
@@ -681,6 +695,8 @@ class GalleryRecord:
     quality: float
     duration_seconds: float
     frame_count: int
+    writer_fps: float
+    encoded_duration_seconds: float
     embedding_method: str
     embedding_aggregation: str = "single_best"
     tracker_backend: str = "custom"
@@ -715,6 +731,8 @@ class GalleryRecord:
             "quality": round(float(self.quality), 4),
             "duration_seconds": round(float(self.duration_seconds), 3),
             "frame_count": int(self.frame_count),
+            "writer_fps": round(float(self.writer_fps), 3),
+            "encoded_duration_seconds": round(float(self.encoded_duration_seconds), 3),
             "embedding_method": self.embedding_method,
             "embedding_aggregation": self.embedding_aggregation,
             "tracker_backend": self.tracker_backend,
@@ -898,7 +916,8 @@ class PersonClipRecorder:
         self.output_size = output_size
         self.record_video_mode = record_video_mode
         self.top_n = max(1, int(top_n))
-        self.writer, self.codec = create_clip_writer(self.clip_path, fps, output_size)
+        self.fps = max(1.0, float(fps))
+        self.writer, self.codec = create_clip_writer(self.clip_path, self.fps, output_size)
         self.started_at = time.monotonic()
         self.created_at = time.time()
         self.last_observed_at = self.started_at
@@ -915,7 +934,7 @@ class PersonClipRecorder:
         if self.writer is None:
             print(f"[gallery] Failed to open clip writer: {self.clip_path}")
         else:
-            print(f"[gallery] Recording track {track_id} with {self.codec}: {self.clip_path}")
+            print(f"[gallery] Recording track {track_id} with {self.codec} {self.fps:.1f}fps: {self.clip_path}")
 
     def observe(self, frame: np.ndarray, person: dict[str, object], frame_index: int = 0) -> None:
         self.last_box = tuple(int(value) for value in person["box"])
@@ -1000,10 +1019,12 @@ class PersonClipRecorder:
             self.writer.release()
 
         duration = time.monotonic() - self.started_at
-        if duration < max(0.0, float(min_clip_seconds)):
+        encoded_duration = float(self.frame_count) / max(1.0, float(self.fps))
+        if encoded_duration < max(0.0, float(min_clip_seconds)):
             print(
                 f"[gallery] Kept short clip on disk but skipped ReID gallery track {self.track_id}: "
-                f"duration={duration:.2f}s min={float(min_clip_seconds):.2f}s reason={reason}"
+                f"encoded_duration={encoded_duration:.2f}s wall_duration={duration:.2f}s "
+                f"frames={self.frame_count} fps={self.fps:.1f} min={float(min_clip_seconds):.2f}s reason={reason}"
             )
             return None
 
@@ -1066,6 +1087,8 @@ class PersonClipRecorder:
             quality=max(0.0, float(self.best_quality)),
             duration_seconds=duration,
             frame_count=self.frame_count,
+            writer_fps=self.fps,
+            encoded_duration_seconds=encoded_duration,
             embedding_method=method,
             embedding_aggregation=f"mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
             tracker_backend=str(tracker_backend),
@@ -1293,7 +1316,12 @@ class LiveTopKCameraContext:
                 self.stop_event.set()
                 break
 
-            cap = create_capture(self.video_source, self.args.frame_width, self.args.frame_height)
+            cap = create_capture(
+                self.video_source,
+                self.args.frame_width,
+                self.args.frame_height,
+                float(self.args.recording_fps),
+            )
             if not cap.isOpened():
                 print(f"[cam {self.cam_id}] Failed to open {self.source_info['display']}; retrying.")
                 time.sleep(self.args.reconnect_delay)
@@ -1393,7 +1421,7 @@ class LiveTopKCameraContext:
                         self.cam_label,
                         track_id,
                         output_size,
-                        fps=30.0,
+                        fps=float(self.args.recording_fps),
                         record_video_mode=str(self.args.record_video_mode),
                         top_n=max(1, int(self.args.live_visual_top_n)),
                     )
@@ -1654,7 +1682,12 @@ class CaptureWorker(threading.Thread):
                 self.stop_event.set()
                 break
 
-            cap = create_capture(context.video_source, context.args.frame_width, context.args.frame_height)
+            cap = create_capture(
+                context.video_source,
+                context.args.frame_width,
+                context.args.frame_height,
+                float(context.args.recording_fps),
+            )
             if not cap.isOpened():
                 print(f"[cam {context.cam_id}] Failed to open {context.source_info['display']}; retrying.")
                 time.sleep(context.args.reconnect_delay)
@@ -1743,7 +1776,7 @@ def main() -> int:
     cam_types = split_cam_types(args.cam_types, len(sources))
     cam_labels = split_cam_labels(args.cam_labels, len(sources))
     if not args.skip_webcam_preflight:
-        preflight_webcams(sources, args.frame_width, args.frame_height)
+        preflight_webcams(sources, args.frame_width, args.frame_height, float(args.recording_fps))
     session_id = time.strftime("%Y%m%d_%H%M%S")
     log_dir = PROJECT_ROOT / "logs" / "topk_live" / session_id
 
@@ -1758,7 +1791,7 @@ def main() -> int:
     print(f"Session: {session_id}")
     print(f"OSC target: {args.osc_host}:{args.osc_port} dry_run={args.osc_dry_run} disabled={args.disable_osc}")
     print(f"Snapshot root: {snapshot_root}")
-    print(f"Record video mode: {args.record_video_mode}")
+    print(f"Record video mode: {args.record_video_mode} recording_fps={float(args.recording_fps):.1f}")
     print(
         f"Tracker backend: {args.tracker_backend} "
         f"tracker_config={display_project_path(tracker_config_path) or 'default'} "

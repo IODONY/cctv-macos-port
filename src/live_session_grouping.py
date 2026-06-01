@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from visual_grouping import VisualGroupRecord, group_records
 from visual_reid import create_visual_embedder
@@ -45,6 +46,13 @@ def read_jsonl(path: Path) -> list[dict[str, object]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def resolve_image_path(path_value: str) -> Path:
+    image_path = Path(str(path_value or "")).expanduser()
+    if not image_path.is_absolute():
+        image_path = (PROJECT_ROOT / image_path).resolve()
+    return image_path
 
 
 def export_asset(source_path: str, destination: Path, mode: str, path_txt_name: str) -> str:
@@ -84,40 +92,60 @@ def resolve_events_path(session_id: str | None = None, events_path: Path | None 
 def embed_gallery_events(
     rows: list[dict[str, object]],
     embedding_model: str,
+    embedding_aggregation: str = "topn",
 ) -> tuple[list[VisualGroupRecord], list[dict[str, object]], str]:
     embedder = create_visual_embedder(model_name=embedding_model)
     records: list[VisualGroupRecord] = []
     failures: list[dict[str, object]] = []
+    normalized_aggregation = str(embedding_aggregation or "topn").strip().lower()
 
     for row in rows:
         clip_id = str(row.get("clip_id") or "")
-        best_frame_path = Path(str(row.get("best_frame_path") or "")).expanduser()
-        if not best_frame_path.is_absolute():
-            best_frame_path = (PROJECT_ROOT / best_frame_path).resolve()
-        image = cv2.imread(str(best_frame_path))
-        if image is None:
+        best_frame_path = resolve_image_path(str(row.get("best_frame_path") or ""))
+        crop_paths = [best_frame_path]
+        if normalized_aggregation == "topn":
+            top_crop_paths = [
+                resolve_image_path(str(path))
+                for path in row.get("top_crop_paths", []) or []
+                if str(path or "").strip()
+            ]
+            if top_crop_paths:
+                crop_paths = top_crop_paths
+
+        crop_embeddings = []
+        method = str(getattr(embedder, "method", embedding_model))
+        failed_paths = []
+        for crop_path in crop_paths:
+            image = cv2.imread(str(crop_path))
+            if image is None:
+                failed_paths.append(str(crop_path))
+                continue
+            embedding, method = embedder.embed_bgr(image)
+            if embedding is not None:
+                crop_embeddings.append(embedding)
+
+        if not crop_embeddings:
             failures.append(
                 {
                     "clip_id": clip_id,
-                    "reason": "best_frame_read_failed",
+                    "reason": "crop_embedding_failed",
                     "best_frame_path": str(best_frame_path),
+                    "attempted_crop_paths": [str(path) for path in crop_paths],
+                    "failed_read_paths": failed_paths,
                 }
             )
             continue
 
-        embedding, method = embedder.embed_bgr(image)
-        if embedding is None:
-            failures.append(
-                {
-                    "clip_id": clip_id,
-                    "reason": "embedding_failed",
-                    "best_frame_path": str(best_frame_path),
-                }
-            )
-            continue
+        if len(crop_embeddings) == 1:
+            embedding = crop_embeddings[0]
+        else:
+            embedding = np.vstack(crop_embeddings).mean(axis=0)
 
         metadata = dict(row)
         metadata["regroup_embedding_method"] = method
+        metadata["regroup_embedding_aggregation"] = (
+            f"mean_top_{len(crop_embeddings)}" if len(crop_embeddings) > 1 else "single_best"
+        )
         records.append(
             VisualGroupRecord(
                 clip_id=clip_id,
@@ -177,7 +205,7 @@ def write_markdown_report(path: Path, payload: dict[str, object]) -> None:
     lines = [
         "# Live Session Regroup Report",
         "",
-        "This report is generated from saved live gallery clips and best ReID crops. It does not run cameras.",
+        "This report is generated from saved live gallery clips and saved ReID crops. It does not run cameras.",
         "",
         "## Summary",
         "",
@@ -186,6 +214,7 @@ def write_markdown_report(path: Path, payload: dict[str, object]) -> None:
         f"- Output: `{payload.get('output_dir')}`",
         f"- Embedding model: `{payload.get('embedding_model')}`",
         f"- Embedding method: `{payload.get('embedding_method')}`",
+        f"- Embedding aggregation: `{payload.get('embedding_aggregation')}`",
         f"- Method: `{grouping.get('method')}`",
         f"- Threshold: `{grouping.get('threshold')}`",
         f"- Reciprocal top-N: `{grouping.get('reciprocal_topn')}`",
@@ -224,6 +253,7 @@ def regroup_live_session(
     session_id: str | None = None,
     events_path: Path | None = None,
     embedding_model: str = "osnet_x0_25",
+    embedding_aggregation: str = "topn",
     method: str = "reciprocal",
     threshold: float = 0.65,
     reciprocal_topn: int = 4,
@@ -234,7 +264,7 @@ def regroup_live_session(
 ) -> dict[str, object]:
     session, events = resolve_events_path(session_id=session_id, events_path=events_path)
     rows = read_jsonl(events)
-    records, failures, embedding_method = embed_gallery_events(rows, embedding_model)
+    records, failures, embedding_method = embed_gallery_events(rows, embedding_model, embedding_aggregation)
     grouping = group_records(records, method=method, threshold=threshold, reciprocal_topn=reciprocal_topn)
 
     root = (snapshot_root or (PROJECT_ROOT / "snapshots" / "live_topk")).expanduser().resolve()
@@ -247,6 +277,7 @@ def regroup_live_session(
         "output_dir": project_relative(output_root),
         "embedding_model": embedding_model,
         "embedding_method": embedding_method,
+        "embedding_aggregation": embedding_aggregation,
         "export_mode": export_mode,
         "source_event_count": len(rows),
         "failures": failures,

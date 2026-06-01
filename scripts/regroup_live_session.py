@@ -21,6 +21,12 @@ def main() -> int:
     parser.add_argument("--session", default="", help="Session id under logs/topk_live/<session>.")
     parser.add_argument("--events-path", default="", help="Explicit gallery_events.jsonl path.")
     parser.add_argument("--embedding-model", default="osnet_x0_25")
+    parser.add_argument(
+        "--embedding-aggregation",
+        choices=("topn", "best"),
+        default="topn",
+        help="Use all saved top crop paths when available, or only the single best crop.",
+    )
     parser.add_argument("--method", choices=("connected", "reciprocal"), default="reciprocal")
     parser.add_argument("--threshold", type=float, default=0.65)
     parser.add_argument("--reciprocal-topn", type=int, default=4)
@@ -36,6 +42,7 @@ def main() -> int:
         session_id=args.session or None,
         events_path=events_path,
         embedding_model=args.embedding_model,
+        embedding_aggregation=args.embedding_aggregation,
         method=args.method,
         threshold=args.threshold,
         reciprocal_topn=args.reciprocal_topn,

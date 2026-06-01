@@ -18,7 +18,7 @@ from wb_core import clamp_gain, normalize_gains
 
 DEFAULT_SETTER_METHOD = "setDayNightModeConfig"
 DEFAULT_EXPOSURE_FIELD = "exp_gain"
-DEFAULT_EXPOSURE_STEP = 100
+DEFAULT_EXPOSURE_STEP = 10
 
 
 def default_backup_dir() -> Path:

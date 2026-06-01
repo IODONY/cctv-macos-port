@@ -10,6 +10,8 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
+
 from evaluate_labeled_clips import (
     PROJECT_ROOT,
     analyze_clip,
@@ -22,6 +24,7 @@ from walnut_core import WalnutAnalyzer
 from visual_reid import (
     analyze_clip_visual,
     create_visual_embedder,
+    normalize_vector,
     serializable_visual_analysis,
 )
 
@@ -276,12 +279,48 @@ def score_candidate(
     }
 
 
-def embedding_similarity(left: dict[str, object], right: dict[str, object]) -> float:
+def _embedding_matrix(value: object) -> np.ndarray | None:
+    if value is None:
+        return None
+    array = np.asarray(value, dtype=np.float32)
+    if array.size == 0:
+        return None
+    if array.ndim == 1:
+        normalized = normalize_vector(array)
+        return None if normalized is None else normalized.reshape(1, -1)
+    rows = []
+    for row in array:
+        normalized = normalize_vector(row)
+        if normalized is not None:
+            rows.append(normalized)
+    if not rows:
+        return None
+    return np.vstack(rows).astype(np.float32)
+
+
+def embedding_similarity(left: dict[str, object], right: dict[str, object], mode: str = "max") -> float:
     left_embedding = left.get("embedding")
     right_embedding = right.get("embedding")
-    if left_embedding is None or right_embedding is None:
+    normalized_mode = str(mode or "max").strip().lower()
+    if normalized_mode == "mean":
+        if left_embedding is None or right_embedding is None:
+            return 0.0
+        return clamp(float(left_embedding @ right_embedding))
+
+    left_matrix = _embedding_matrix(left.get("prototype_embeddings"))
+    right_matrix = _embedding_matrix(right.get("prototype_embeddings"))
+    if left_matrix is None:
+        left_matrix = _embedding_matrix(left_embedding)
+    if right_matrix is None:
+        right_matrix = _embedding_matrix(right_embedding)
+    if left_matrix is None or right_matrix is None:
         return 0.0
-    return clamp(float(left_embedding @ right_embedding))
+    scores = np.clip(left_matrix @ right_matrix.T, -1.0, 1.0).reshape(-1)
+    if scores.size == 0:
+        return 0.0
+    if normalized_mode == "top2-mean" and scores.size >= 2:
+        return clamp(float(np.mean(np.sort(scores)[-2:])))
+    return clamp(float(np.max(scores)))
 
 
 def visual_outcome(score: float, match_threshold: float, ambiguous_threshold: float) -> str:
@@ -299,7 +338,7 @@ def score_visual_candidate(
     query_analysis: dict[str, object],
     candidate_analysis: dict[str, object],
 ) -> dict[str, object]:
-    score = embedding_similarity(query_analysis, candidate_analysis)
+    score = embedding_similarity(query_analysis, candidate_analysis, args.prototype_score_mode)
     outcome = visual_outcome(score, args.visual_match_threshold, args.visual_ambiguous_threshold)
     is_same_identity = same_identity(query_clip, candidate_clip)
     hard_negative = not is_same_identity and query_clip.cam_id == candidate_clip.cam_id
@@ -755,6 +794,10 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
                 debug_dir=debug_dir,
                 embedding_cache_dir=embedding_cache_dir,
                 crop_expand_ratio=args.crop_expand_ratio,
+                selection_strategy=args.crop_selection_strategy,
+                diversity_min_frame_gap=args.crop_diversity_min_frame_gap,
+                diversity_max_similarity=args.crop_diversity_max_similarity,
+                crop_min_quality_ratio=args.crop_min_quality_ratio,
             )
 
     query_results = []
@@ -860,6 +903,8 @@ def evaluate_retrieval(args: argparse.Namespace) -> dict[str, object]:
         "retrieval_backend": backend,
         "embedding_model": args.embedding_model if backend in {"visual", "hybrid"} else "",
         "visual_top_n": args.visual_top_n if backend in {"visual", "hybrid"} else 0,
+        "crop_selection_strategy": args.crop_selection_strategy if backend in {"visual", "hybrid"} else "",
+        "prototype_score_mode": args.prototype_score_mode if backend in {"visual", "hybrid"} else "",
         "visual_color_weight": args.visual_color_weight if backend in {"visual", "hybrid"} else 0.0,
         "hybrid_visual_weight": args.hybrid_visual_weight if backend == "hybrid" else 0.0,
         "visual_rescue_count": args.visual_rescue_count if backend == "hybrid" else 0,
@@ -924,6 +969,8 @@ def write_eval_report(path: Path, report: dict[str, object]) -> None:
         if report.get("embedding_model"):
             fh.write(f"- Embedding model: `{report['embedding_model']}`\n")
             fh.write(f"- Visual top-N crops: `{report['visual_top_n']}`\n")
+            fh.write(f"- Crop selection strategy: `{report.get('crop_selection_strategy', '')}`\n")
+            fh.write(f"- Prototype score mode: `{report.get('prototype_score_mode', '')}`\n")
             fh.write(f"- Visual color weight: `{report['visual_color_weight']}`\n")
             if report.get("retrieval_backend") == "hybrid":
                 fh.write(f"- Hybrid visual weight: `{report['hybrid_visual_weight']}`\n")
@@ -1155,7 +1202,12 @@ def main() -> int:
         choices=("osnet_x0_25", "mobilenet_v3_large", "mobilenet_v3_small", "efficientnet_b0", "hsv_histogram"),
         default="osnet_x0_25",
     )
-    parser.add_argument("--visual-top-n", type=int, default=1)
+    parser.add_argument("--visual-top-n", type=int, default=6)
+    parser.add_argument("--crop-selection-strategy", choices=("diverse-quality", "quality-only"), default="diverse-quality")
+    parser.add_argument("--prototype-score-mode", choices=("max", "top2-mean", "mean"), default="max")
+    parser.add_argument("--crop-diversity-min-frame-gap", type=int, default=15)
+    parser.add_argument("--crop-diversity-max-similarity", type=float, default=0.92)
+    parser.add_argument("--crop-min-quality-ratio", type=float, default=0.70)
     parser.add_argument("--visual-vote-frame-window", type=int, default=20)
     parser.add_argument("--visual-color-weight", type=float, default=0.2)
     parser.add_argument("--hybrid-visual-weight", type=float, default=0.35)

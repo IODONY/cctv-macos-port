@@ -33,10 +33,13 @@ from pythonosc.udp_client import SimpleUDPClient
 
 from live_session_grouping import regroup_live_session
 from visual_reid import (
+    crop_candidate_to_json,
     create_visual_embedder,
     crop_person as visual_crop_person,
     crop_quality as visual_crop_quality,
+    make_crop_candidate,
     resize_with_padding as visual_resize_with_padding,
+    select_diverse_crop_candidates,
 )
 from walnut_core import WalnutAnalyzer
 
@@ -208,12 +211,165 @@ def parse_args() -> argparse.Namespace:
         help="Keep writing a gallery clip this long after the tracker stops seeing the person.",
     )
     parser.add_argument(
+        "--disable-tracklet-stitching",
+        action="store_true",
+        help="Disable conservative same-person recorder stitching when tracker ids briefly split.",
+    )
+    parser.add_argument(
+        "--stitch-window-seconds",
+        type=float,
+        default=1.5,
+        help="Seconds to keep a missing track eligible for conservative same-person stitching.",
+    )
+    parser.add_argument(
+        "--stitch-reid-threshold",
+        type=float,
+        default=0.76,
+        help="Minimum OSNet cosine similarity required to stitch a new track into a recent recorder.",
+    )
+    parser.add_argument(
+        "--stitch-ambiguous-margin",
+        type=float,
+        default=0.08,
+        help="Required score gap between the best and second-best stitch candidate.",
+    )
+    parser.add_argument(
+        "--stitch-max-center-distance-ratio",
+        type=float,
+        default=0.35,
+        help="Maximum bbox center movement as a ratio of frame diagonal for stitching.",
+    )
+    parser.add_argument(
+        "--stitch-spatial-resume-window-seconds",
+        type=float,
+        default=1.5,
+        help="Allow a lower-score stitch within this gap when bbox continuity is extremely strong.",
+    )
+    parser.add_argument(
+        "--stitch-spatial-resume-max-distance-ratio",
+        type=float,
+        default=0.02,
+        help="BBox center distance for strong spatial-continuity stitching.",
+    )
+    parser.add_argument(
+        "--stitch-spatial-resume-min-score",
+        type=float,
+        default=0.55,
+        help="Minimum ReID score for strong spatial-continuity stitching.",
+    )
+    parser.add_argument(
+        "--stitch-micro-gap-seconds",
+        type=float,
+        default=0.35,
+        help="Allow a very short track-id split to stitch with a lower ReID score when not crowded.",
+    )
+    parser.add_argument(
+        "--stitch-micro-gap-max-distance-ratio",
+        type=float,
+        default=0.06,
+        help="BBox center distance for very short track-id split stitching.",
+    )
+    parser.add_argument(
+        "--stitch-micro-gap-min-score",
+        type=float,
+        default=0.35,
+        help="Minimum ReID score for very short track-id split stitching.",
+    )
+    parser.add_argument(
+        "--stitch-crowded-window-seconds",
+        type=float,
+        default=2.0,
+        help="Reject stitching for this long after multi-person/overlap frames unless crowded stitching is allowed.",
+    )
+    parser.add_argument(
+        "--stitch-crowded-near-distance-ratio",
+        type=float,
+        default=0.08,
+        help=(
+            "Allow stitching through a recent crowded/duplicate-detection window when bbox centers are this close. "
+            "This keeps single-person duplicate boxes from splitting clips."
+        ),
+    )
+    parser.add_argument(
+        "--disable-duplicate-track-suppression",
+        action="store_true",
+        help="Disable low-quality duplicate person-track suppression before starting a new recorder.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-reid-threshold",
+        type=float,
+        default=0.76,
+        help="Minimum prototype ReID score for absorbing a simultaneous duplicate track into an active recorder.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-max-center-distance-ratio",
+        type=float,
+        default=0.12,
+        help="Maximum bbox center distance for duplicate track absorption.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-min-iou",
+        type=float,
+        default=0.50,
+        help="IoU threshold for geometry-only duplicate track absorption.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-min-containment",
+        type=float,
+        default=0.85,
+        help="Intersection-over-smaller-box threshold for duplicate track absorption.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-low-quality-max",
+        type=float,
+        default=0.45,
+        help="Max crop quality for low-quality duplicate absorption by geometry.",
+    )
+    parser.add_argument(
+        "--duplicate-absorb-low-quality-distance-ratio",
+        type=float,
+        default=0.08,
+        help="Center-distance threshold for low-quality duplicate absorption.",
+    )
+    parser.add_argument(
+        "--duplicate-track-max-quality",
+        type=float,
+        default=0.45,
+        help="Only suppress a new duplicate-looking track when its crop quality is at or below this value.",
+    )
+    parser.add_argument(
+        "--duplicate-track-min-iou",
+        type=float,
+        default=0.12,
+        help="Suppress low-quality duplicate tracks when they overlap an active track by at least this IoU.",
+    )
+    parser.add_argument(
+        "--duplicate-track-max-center-distance-ratio",
+        type=float,
+        default=0.10,
+        help="Suppress low-quality duplicate tracks when centers are this close to an active track.",
+    )
+    parser.add_argument(
+        "--stitch-allow-crowded",
+        action="store_true",
+        help="Allow stitching even after recent crowded frames. Default is conservative rejection.",
+    )
+    parser.add_argument(
         "--min-clip-seconds",
         type=float,
         default=1.5,
         help=(
             "Closed gallery clips with encoded playback duration shorter than this are kept on disk "
             "but not added to the ReID gallery."
+        ),
+    )
+    parser.add_argument(
+        "--min-gallery-crop-quality",
+        type=float,
+        default=0.45,
+        help=(
+            "Closed clips with best ReID crop quality below this are kept in _discarded "
+            "instead of being registered in the Top-K gallery."
         ),
     )
     parser.add_argument(
@@ -248,8 +404,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--live-visual-top-n",
         type=int,
-        default=3,
-        help="Number of best live person crops to average into a gallery tracklet embedding.",
+        default=6,
+        help="Number of diverse live person crops to store as gallery tracklet prototypes.",
+    )
+    parser.add_argument(
+        "--crop-selection-strategy",
+        choices=("diverse-quality", "quality-only"),
+        default="diverse-quality",
+        help="How to select best ReID crops from a clip or live tracklet.",
+    )
+    parser.add_argument(
+        "--prototype-score-mode",
+        choices=("max", "top2-mean", "mean"),
+        default="max",
+        help="How query/gallery and similarity grouping compare crop prototype embeddings.",
+    )
+    parser.add_argument(
+        "--crop-diversity-min-frame-gap",
+        type=int,
+        default=15,
+        help="Preferred minimum source-frame gap between selected diverse crops.",
+    )
+    parser.add_argument(
+        "--crop-diversity-max-similarity",
+        type=float,
+        default=0.92,
+        help="Color-histogram similarity above which nearby crop candidates are considered duplicate-like.",
+    )
+    parser.add_argument(
+        "--crop-min-quality-ratio",
+        type=float,
+        default=0.70,
+        help="Minimum quality ratio to the best crop before a candidate is considered for diversity selection.",
     )
     parser.add_argument(
         "--embedding-model",
@@ -516,6 +702,167 @@ def compact_event_token(event_id: object, digits: int = 6) -> str:
     return f"e{text[-max(1, int(digits)):]}"
 
 
+def box_center(box: Iterable[float]) -> tuple[float, float]:
+    x1, y1, x2, y2 = [float(value) for value in box]
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def box_iou(box_a: Iterable[float], box_b: Iterable[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(value) for value in box_a]
+    bx1, by1, bx2, by2 = [float(value) for value in box_b]
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    if union <= 1e-8:
+        return 0.0
+    return float(intersection / union)
+
+
+def box_intersection_over_min_area(box_a: Iterable[float], box_b: Iterable[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(value) for value in box_a]
+    bx1, by1, bx2, by2 = [float(value) for value in box_b]
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    intersection = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    min_area = max(1e-8, min(area_a, area_b))
+    return float(intersection / min_area)
+
+
+def box_center_distance_ratio(
+    box_a: Iterable[float],
+    box_b: Iterable[float],
+    frame_shape: tuple[int, ...],
+) -> float:
+    ax, ay = box_center(box_a)
+    bx, by = box_center(box_b)
+    height = float(frame_shape[0]) if frame_shape else 1.0
+    width = float(frame_shape[1]) if len(frame_shape) > 1 else 1.0
+    diagonal = max(1.0, math.sqrt((width * width) + (height * height)))
+    return float(math.sqrt(((ax - bx) ** 2) + ((ay - by) ** 2)) / diagonal)
+
+
+def has_crowded_overlap(people: list[dict[str, object]], iou_threshold: float = 0.03) -> bool:
+    if len(people) < 2:
+        return False
+    return True
+
+
+def source_is_finite_video(source_info: dict[str, object]) -> bool:
+    return str(source_info.get("kind") or "") == "video"
+
+
+def video_source_frame_interval(source_info: dict[str, object], requested_fps: float) -> float:
+    if not source_is_finite_video(source_info):
+        return 0.0
+    fps = max(1.0, float(requested_fps))
+    return 1.0 / fps
+
+
+def sleep_for_finite_video_frame(next_frame_at: float, interval: float, stop_event: threading.Event) -> float:
+    if interval <= 0:
+        return next_frame_at
+    next_frame_at = max(next_frame_at + interval, time.monotonic())
+    while not stop_event.is_set():
+        delay = next_frame_at - time.monotonic()
+        if delay <= 0:
+            break
+        time.sleep(min(0.02, delay))
+    return next_frame_at
+
+
+def should_allow_crowded_stitch_by_geometry(
+    candidates: list[tuple[str, int, "PersonClipRecorder", float, tuple[int, ...]]],
+    person: dict[str, object],
+    frame_shape: tuple[int, ...],
+    max_distance_ratio: float,
+) -> bool:
+    if not candidates:
+        return False
+    nearest = min(
+        box_center_distance_ratio(old_box, person["box"], frame_shape)
+        for _source, _old_track_id, _recorder, _time_gap, old_box in candidates
+    )
+    return nearest <= max(0.0, float(max_distance_ratio))
+
+
+def spatial_continuity_stitch_reason(
+    score: float,
+    time_gap_seconds: float,
+    center_distance_ratio: float,
+    args: argparse.Namespace,
+    crowded_recent: bool,
+) -> str:
+    if crowded_recent:
+        return ""
+    score_value = float(score)
+    time_gap = float(time_gap_seconds)
+    distance = float(center_distance_ratio)
+
+    if (
+        time_gap <= float(getattr(args, "stitch_spatial_resume_window_seconds", 1.5))
+        and distance <= float(getattr(args, "stitch_spatial_resume_max_distance_ratio", 0.02))
+        and score_value >= float(getattr(args, "stitch_spatial_resume_min_score", 0.55))
+    ):
+        return "spatial_continuity_stitched"
+
+    if (
+        time_gap <= float(getattr(args, "stitch_micro_gap_seconds", 0.35))
+        and distance <= float(getattr(args, "stitch_micro_gap_max_distance_ratio", 0.06))
+        and score_value >= float(getattr(args, "stitch_micro_gap_min_score", 0.35))
+    ):
+        return "micro_gap_spatial_stitched"
+    return ""
+
+
+@dataclass
+class PendingStitchRecorder:
+    recorder: "PersonClipRecorder"
+    pending_since: float
+    expires_at: float
+    close_reason: str
+
+
+@dataclass
+class StitchDecision:
+    accepted: bool
+    reason: str
+    old_track_id: int
+    new_track_id: int
+    source: str = ""
+    score: float = 0.0
+    second_score: float = 0.0
+    center_distance_ratio: float = 0.0
+    time_gap_seconds: float = 0.0
+    embedding_method: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "accepted": bool(self.accepted),
+            "reason": self.reason,
+            "old_track_id": int(self.old_track_id),
+            "new_track_id": int(self.new_track_id),
+            "source": self.source,
+            "score": round(float(self.score), 6),
+            "second_score": round(float(self.second_score), 6),
+            "center_distance_ratio": round(float(self.center_distance_ratio), 6),
+            "time_gap_seconds": round(float(self.time_gap_seconds), 3),
+            "embedding_method": self.embedding_method,
+        }
+
+
 def export_asset(source_path: str, destination: Path, mode: str, path_txt_name: str) -> str:
     if not str(source_path or "").strip():
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -739,6 +1086,82 @@ class AppearanceEmbedder:
         return self.delegate.embed_bgr(image_bgr)
 
 
+def normalize_embedding_matrix(embeddings: object) -> np.ndarray | None:
+    if embeddings is None:
+        return None
+    array = np.asarray(embeddings, dtype=np.float32)
+    if array.size == 0:
+        return None
+    if array.ndim == 1:
+        normalized = normalize_vector(array)
+        return None if normalized is None else normalized.reshape(1, -1)
+    rows = []
+    for row in array:
+        normalized = normalize_vector(row)
+        if normalized is not None:
+            rows.append(normalized)
+    if not rows:
+        return None
+    return np.vstack(rows).astype(np.float32)
+
+
+def prototype_similarity(
+    query_embedding: np.ndarray | None,
+    record_embedding: np.ndarray | None,
+    record_prototypes: object = None,
+    mode: str = "max",
+) -> float:
+    query = normalize_vector(query_embedding)
+    if query is None:
+        return 0.0
+    prototypes = normalize_embedding_matrix(record_prototypes)
+    normalized_mode = str(mode or "max").strip().lower()
+    if prototypes is None:
+        record = normalize_vector(record_embedding)
+        return 0.0 if record is None else float(np.dot(query, record))
+    scores = np.clip(prototypes @ query, -1.0, 1.0)
+    if scores.size == 0:
+        return 0.0
+    if normalized_mode == "mean":
+        record = normalize_vector(record_embedding)
+        return 0.0 if record is None else float(np.dot(query, record))
+    if normalized_mode == "top2-mean" and scores.size >= 2:
+        top_scores = np.sort(scores)[-2:]
+        return float(np.mean(top_scores))
+    return float(np.max(scores))
+
+
+def prototype_set_similarity(
+    left_embedding: np.ndarray | None,
+    right_embedding: np.ndarray | None,
+    left_prototypes: object = None,
+    right_prototypes: object = None,
+    mode: str = "max",
+) -> float:
+    normalized_mode = str(mode or "max").strip().lower()
+    if normalized_mode == "mean":
+        left = normalize_vector(left_embedding)
+        right = normalize_vector(right_embedding)
+        return 0.0 if left is None or right is None else float(np.dot(left, right))
+
+    left_matrix = normalize_embedding_matrix(left_prototypes)
+    right_matrix = normalize_embedding_matrix(right_prototypes)
+    if left_matrix is None:
+        left = normalize_vector(left_embedding)
+        left_matrix = None if left is None else left.reshape(1, -1)
+    if right_matrix is None:
+        right = normalize_vector(right_embedding)
+        right_matrix = None if right is None else right.reshape(1, -1)
+    if left_matrix is None or right_matrix is None:
+        return 0.0
+    scores = np.clip(left_matrix @ right_matrix.T, -1.0, 1.0).reshape(-1)
+    if scores.size == 0:
+        return 0.0
+    if normalized_mode == "top2-mean" and scores.size >= 2:
+        return float(np.mean(np.sort(scores)[-2:]))
+    return float(np.max(scores))
+
+
 @dataclass
 class GalleryRecord:
     clip_id: str
@@ -761,9 +1184,20 @@ class GalleryRecord:
     embedding_method: str
     recording_interrupted: bool = False
     embedding_aggregation: str = "single_best"
+    prototype_embeddings: np.ndarray | None = None
+    prototype_score_mode: str = "max"
+    prototype_count: int = 0
+    crop_selection_strategy: str = "diverse-quality"
     tracker_backend: str = "custom"
     tracker_config_path: str = ""
     tracker_with_reid: bool | None = None
+    close_reason: str = ""
+    original_track_id: int = 0
+    current_track_id: int = 0
+    stitched_track_ids: list[int] | None = None
+    stitch_events: list[dict[str, object]] | None = None
+    absorbed_track_ids: list[int] | None = None
+    track_ownership_events: list[dict[str, object]] | None = None
     source_fps: float = 0.0
     analyzed_fps: float = 0.0
     dropped_frame_count: int = 0
@@ -801,7 +1235,19 @@ class GalleryRecord:
             "recording_interrupted": bool(self.recording_interrupted),
             "embedding_method": self.embedding_method,
             "embedding_aggregation": self.embedding_aggregation,
+            "prototype_score_mode": self.prototype_score_mode,
+            "prototype_count": int(self.prototype_count or 0),
+            "crop_selection_strategy": self.crop_selection_strategy,
             "tracker_backend": self.tracker_backend,
+            "close_reason": self.close_reason,
+            "original_track_id": int(self.original_track_id or self.track_id),
+            "current_track_id": int(self.current_track_id or self.track_id),
+            "stitched_track_ids": [int(value) for value in (self.stitched_track_ids or [self.track_id])],
+            "stitch_event_count": len(self.stitch_events or []),
+            "stitch_events": list(self.stitch_events or []),
+            "absorbed_track_ids": [int(value) for value in (self.absorbed_track_ids or [])],
+            "track_ownership_event_count": len(self.track_ownership_events or []),
+            "track_ownership_events": list(self.track_ownership_events or []),
             "source_fps": round(float(self.source_fps), 3),
             "analyzed_fps": round(float(self.analyzed_fps), 3),
             "dropped_frame_count": int(self.dropped_frame_count),
@@ -854,6 +1300,10 @@ class LiveTopKGallery:
         if embedding is None:
             return False
         record.embedding = embedding
+        prototypes = normalize_embedding_matrix(record.prototype_embeddings)
+        if prototypes is not None:
+            record.prototype_embeddings = prototypes
+            record.prototype_count = int(prototypes.shape[0])
         with self.lock:
             if record.clip_id in self.seen_clip_ids:
                 return False
@@ -866,13 +1316,20 @@ class LiveTopKGallery:
         embedding = normalize_vector(record.embedding)
         if embedding is None:
             return {"group_id": 0, "group_label": "", "score": 0.0, "count": 0}
+        record_prototypes = normalize_embedding_matrix(record.prototype_embeddings)
 
         with self.lock:
             best_group = None
             best_score = -1.0
             for group in self.similarity_groups:
                 centroid = np.asarray(group["centroid"], dtype=np.float32)
-                score = float(np.dot(embedding, centroid))
+                score = prototype_set_similarity(
+                    embedding,
+                    centroid,
+                    record_prototypes,
+                    group.get("prototypes"),
+                    str(record.prototype_score_mode or "max"),
+                )
                 if score > best_score:
                     best_score = score
                     best_group = group
@@ -883,6 +1340,7 @@ class LiveTopKGallery:
                     "group_id": group_id,
                     "group_label": f"group_{group_id:03d}",
                     "centroid": embedding,
+                    "prototypes": record_prototypes if record_prototypes is not None else embedding.reshape(1, -1),
                     "count": 0,
                 }
                 self.similarity_groups.append(best_group)
@@ -892,6 +1350,13 @@ class LiveTopKGallery:
             centroid = np.asarray(best_group["centroid"], dtype=np.float32)
             updated_centroid = normalize_vector((centroid * float(best_group["count"])) + embedding)
             best_group["centroid"] = embedding if updated_centroid is None else updated_centroid
+            group_prototypes = normalize_embedding_matrix(best_group.get("prototypes"))
+            incoming = record_prototypes if record_prototypes is not None else embedding.reshape(1, -1)
+            if group_prototypes is None:
+                best_group["prototypes"] = incoming
+            else:
+                merged = np.vstack([group_prototypes, incoming])
+                best_group["prototypes"] = merged[:24] if merged.shape[0] > 24 else merged
             best_group["count"] = count
 
             return {
@@ -912,7 +1377,12 @@ class LiveTopKGallery:
 
         scored = []
         for record in records:
-            score = float(np.dot(query, record.embedding))
+            score = prototype_similarity(
+                query,
+                record.embedding,
+                record.prototype_embeddings,
+                str(record.prototype_score_mode or "max"),
+            )
             scored.append((score, record))
         scored.sort(key=lambda item: item[0], reverse=True)
 
@@ -933,6 +1403,8 @@ class LiveTopKGallery:
                     "fallback": bool(score < fallback_score),
                     "quality": record.quality,
                     "embedding_aggregation": record.embedding_aggregation,
+                    "prototype_score_mode": record.prototype_score_mode,
+                    "prototype_count": int(record.prototype_count or 0),
                 }
             )
         return results[:k]
@@ -964,6 +1436,11 @@ class PersonClipRecorder:
         fps: float,
         record_video_mode: str,
         top_n: int = 1,
+        selection_strategy: str = "diverse-quality",
+        diversity_min_frame_gap: int = 15,
+        diversity_max_similarity: float = 0.92,
+        crop_min_quality_ratio: float = 0.70,
+        prototype_score_mode: str = "max",
     ):
         event_id = str(int(time.time() * 1000))
         safe_session = sanitize_id(session_id)
@@ -977,11 +1454,24 @@ class PersonClipRecorder:
         self.cam_id = safe_cam
         self.cam_label = safe_cam_label
         self.track_id = int(track_id)
+        self.original_track_id = int(track_id)
+        self.current_track_id = int(track_id)
+        self.owned_track_ids = {int(track_id)}
+        self.absorbed_track_ids: list[int] = []
+        self.track_ownership_events: list[dict[str, object]] = []
+        self.stitched_track_ids = [int(track_id)]
+        self.stitch_events: list[dict[str, object]] = []
         self.clip_path = clip_dir / f"{clip_id}.mp4"
         self.best_frame_path = clip_dir / f"{clip_id}_best.jpg"
         self.output_size = output_size
         self.record_video_mode = record_video_mode
         self.top_n = max(1, int(top_n))
+        self.selection_strategy = str(selection_strategy or "diverse-quality")
+        self.diversity_min_frame_gap = int(diversity_min_frame_gap)
+        self.diversity_max_similarity = float(diversity_max_similarity)
+        self.crop_min_quality_ratio = float(crop_min_quality_ratio)
+        self.prototype_score_mode = str(prototype_score_mode or "max")
+        self.candidate_pool_limit = max(30, self.top_n * 12)
         self.fps = max(1.0, float(fps))
         self.writer, self.codec = create_clip_writer(self.clip_path, self.fps, output_size)
         self.started_at = time.monotonic()
@@ -1001,6 +1491,12 @@ class PersonClipRecorder:
         self.best_quality = -1.0
         self.best_candidate_metadata: dict[str, object] | None = None
         self.crop_candidates: list[dict[str, object]] = []
+        self._stitch_embedding: np.ndarray | None = None
+        self._stitch_embedding_method = ""
+        self._stitch_embedding_signature: tuple[object, ...] | None = None
+        self._stitch_prototype_embeddings: np.ndarray | None = None
+        self._stitch_prototype_method = ""
+        self._stitch_prototype_signature: tuple[object, ...] | None = None
         self.closed = False
         if self.writer is None:
             print(f"[gallery] Failed to open clip writer: {self.clip_path}")
@@ -1026,6 +1522,12 @@ class PersonClipRecorder:
             "cam_id": self.cam_id,
             "cam_label": self.cam_label,
             "track_id": int(self.track_id),
+            "original_track_id": int(self.original_track_id),
+            "current_track_id": int(self.current_track_id),
+            "stitched_track_ids": [int(value) for value in self.stitched_track_ids],
+            "owned_track_ids": sorted(int(value) for value in self.owned_track_ids),
+            "absorbed_track_ids": [int(value) for value in self.absorbed_track_ids],
+            "track_ownership_events": list(self.track_ownership_events),
             "reason": str(reason),
             "details": details or {},
             "moved_paths": moved_paths,
@@ -1034,6 +1536,11 @@ class PersonClipRecorder:
         print(f"[gallery] Moved invalid clip to _discarded reason={reason}: {self.clip_id}")
 
     def observe(self, frame: np.ndarray, person: dict[str, object], frame_index: int = 0) -> None:
+        person_track_id = int(person.get("track_id", self.current_track_id) or self.current_track_id)
+        if person_track_id > 0:
+            self.owned_track_ids.add(person_track_id)
+            self.current_track_id = person_track_id
+            self.track_id = person_track_id
         self.last_box = tuple(int(value) for value in person["box"])
         self.last_person = person
         self.last_observed_at = time.monotonic()
@@ -1042,17 +1549,9 @@ class PersonClipRecorder:
         crop = visual_crop_person(frame, self.last_box)
         quality = visual_crop_quality(crop, person, frame.shape)
         if crop is not None:
-            self.crop_candidates.append(
-                {
-                    "crop": crop,
-                    "quality": float(quality),
-                    "frame_index": int(frame_index),
-                    "box": [int(value) for value in self.last_box],
-                    "confidence": float(person.get("confidence", 0.0)),
-                }
-            )
+            self.crop_candidates.append(make_crop_candidate(frame_index, crop, person, frame.shape, quality))
             self.crop_candidates.sort(key=lambda item: float(item["quality"]), reverse=True)
-            self.crop_candidates = self.crop_candidates[: self.top_n]
+            self.crop_candidates = self.crop_candidates[: self.candidate_pool_limit]
             best = self.crop_candidates[0]
             self.best_crop = best["crop"]
             self.best_quality = float(best["quality"])
@@ -1062,6 +1561,97 @@ class PersonClipRecorder:
                 "confidence": float(best["confidence"]),
                 "quality": float(best["quality"]),
             }
+            self._stitch_embedding = None
+            self._stitch_embedding_method = ""
+            self._stitch_embedding_signature = None
+            self._stitch_prototype_embeddings = None
+            self._stitch_prototype_method = ""
+            self._stitch_prototype_signature = None
+
+    def stitch_signature(self) -> tuple[object, ...] | None:
+        if not self.best_candidate_metadata:
+            return None
+        return (
+            int(self.best_candidate_metadata.get("frame_index") or 0),
+            tuple(int(value) for value in self.best_candidate_metadata.get("box") or []),
+            round(float(self.best_candidate_metadata.get("quality") or 0.0), 6),
+        )
+
+    def stitch_embedding(self, embedder: AppearanceEmbedder) -> tuple[np.ndarray | None, str]:
+        if self.best_crop is None:
+            return None, ""
+        signature = self.stitch_signature()
+        if self._stitch_embedding is not None and self._stitch_embedding_signature == signature:
+            return self._stitch_embedding, self._stitch_embedding_method
+        embedding, method = embedder.embed_bgr(self.best_crop)
+        normalized = normalize_vector(embedding)
+        self._stitch_embedding = normalized
+        self._stitch_embedding_method = method
+        self._stitch_embedding_signature = signature
+        return normalized, method
+
+    def stitch_prototype_embeddings(self, embedder: AppearanceEmbedder) -> tuple[np.ndarray | None, str]:
+        selected = select_diverse_crop_candidates(
+            self.crop_candidates,
+            top_n=self.top_n,
+            selection_strategy=self.selection_strategy,
+            min_frame_gap=self.diversity_min_frame_gap,
+            max_similarity=self.diversity_max_similarity,
+            min_quality_ratio=self.crop_min_quality_ratio,
+        )
+        signature = tuple(
+            (
+                int(candidate.get("frame_index") or 0),
+                tuple(int(value) for value in candidate.get("box") or []),
+                round(float(candidate.get("quality") or 0.0), 6),
+            )
+            for candidate in selected
+        )
+        if (
+            self._stitch_prototype_embeddings is not None
+            and self._stitch_prototype_signature == signature
+        ):
+            return self._stitch_prototype_embeddings, self._stitch_prototype_method
+
+        embeddings = []
+        methods = []
+        for candidate in selected:
+            embedding, method = embedder.embed_bgr(candidate.get("crop"))
+            normalized = normalize_vector(embedding)
+            if normalized is not None:
+                embeddings.append(normalized)
+                methods.append(method)
+        if not embeddings:
+            embedding, method = self.stitch_embedding(embedder)
+            if embedding is None:
+                return None, method
+            embeddings.append(embedding)
+            methods.append(method)
+
+        prototypes = np.vstack(embeddings).astype(np.float32)
+        self._stitch_prototype_embeddings = prototypes
+        self._stitch_prototype_method = methods[-1] if methods else embedder.method
+        self._stitch_prototype_signature = signature
+        return prototypes, self._stitch_prototype_method
+
+    def reassign_track_id(self, new_track_id: int, stitch_event: dict[str, object]) -> None:
+        self.track_id = int(new_track_id)
+        self.current_track_id = int(new_track_id)
+        self.owned_track_ids.add(int(new_track_id))
+        if int(new_track_id) not in self.stitched_track_ids:
+            self.stitched_track_ids.append(int(new_track_id))
+        self.stitch_events.append(dict(stitch_event))
+
+    def absorb_track_id(self, new_track_id: int, ownership_event: dict[str, object]) -> None:
+        new_track_id = int(new_track_id)
+        self.track_id = new_track_id
+        self.current_track_id = new_track_id
+        self.owned_track_ids.add(new_track_id)
+        if new_track_id not in self.absorbed_track_ids:
+            self.absorbed_track_ids.append(new_track_id)
+        if new_track_id not in self.stitched_track_ids:
+            self.stitched_track_ids.append(new_track_id)
+        self.track_ownership_events.append(dict(ownership_event))
 
     def mark_missing(self, now: float | None = None) -> None:
         self.missing_analyses += 1
@@ -1072,8 +1662,8 @@ class PersonClipRecorder:
         if self.missing_since is None:
             return False
         now = time.monotonic()
-        if post_roll_seconds >= 0 and (now - self.missing_since) >= float(post_roll_seconds):
-            return True
+        if post_roll_seconds >= 0:
+            return (now - self.missing_since) >= float(post_roll_seconds)
         return self.missing_analyses > max(1, int(track_missing_grace))
 
     def write_frame(
@@ -1122,6 +1712,7 @@ class PersonClipRecorder:
         post_roll_seconds: float = 0.0,
         min_recorded_frames: int = 0,
         min_unique_frames: int = 0,
+        min_gallery_crop_quality: float = 0.0,
     ) -> GalleryRecord | None:
         if self.closed:
             return None
@@ -1202,13 +1793,39 @@ class PersonClipRecorder:
                 },
             )
             return None
+        if self.best_quality < max(0.0, float(min_gallery_crop_quality)):
+            print(
+                f"[gallery] Skipped low-quality ReID gallery track {self.track_id}: "
+                f"quality={self.best_quality:.3f} min_quality={float(min_gallery_crop_quality):.3f} "
+                f"encoded_duration={encoded_duration:.2f}s reason={reason}"
+            )
+            self.discard_clip(
+                "low_reid_crop_quality",
+                {
+                    "close_reason": reason,
+                    "encoded_duration_seconds": round(encoded_duration, 3),
+                    "frame_count": int(self.frame_count),
+                    "unique_frame_count": int(self.unique_frame_count),
+                    "best_crop_quality": round(float(self.best_quality), 4),
+                    "min_gallery_crop_quality": round(float(min_gallery_crop_quality), 4),
+                },
+            )
+            return None
 
         self.best_frame_path.parent.mkdir(parents=True, exist_ok=True)
         top_crop_paths: list[str] = []
         top_crop_metadata: list[dict[str, object]] = []
         crop_embeddings = []
         methods = []
-        for index, candidate in enumerate(self.crop_candidates[: self.top_n], start=1):
+        selected_candidates = select_diverse_crop_candidates(
+            self.crop_candidates,
+            top_n=self.top_n,
+            selection_strategy=self.selection_strategy,
+            min_frame_gap=self.diversity_min_frame_gap,
+            max_similarity=self.diversity_max_similarity,
+            min_quality_ratio=self.crop_min_quality_ratio,
+        )
+        for index, candidate in enumerate(selected_candidates, start=1):
             crop = candidate["crop"]
             if index == 1:
                 crop_path = self.best_frame_path
@@ -1219,26 +1836,23 @@ class PersonClipRecorder:
             cv2.imwrite(str(crop_path), crop)
             resolved_crop_path = str(crop_path.resolve()).replace("\\", "/")
             top_crop_paths.append(resolved_crop_path)
-            top_crop_metadata.append(
-                {
-                    "rank": int(index),
-                    "path": resolved_crop_path,
-                    "track_id": int(self.track_id),
-                    "frame_index": int(candidate["frame_index"]),
-                    "box": [int(value) for value in candidate["box"]],
-                    "confidence": round(float(candidate["confidence"]), 6),
-                    "quality": round(float(candidate["quality"]), 6),
-                }
-            )
+            candidate["rank"] = int(index)
+            metadata = crop_candidate_to_json(candidate, resolved_crop_path)
+            metadata["track_id"] = int(self.track_id)
+            top_crop_metadata.append(metadata)
             embedding, method = embedder.embed_bgr(crop)
             if embedding is not None:
-                crop_embeddings.append(embedding)
+                normalized = normalize_vector(embedding)
+                if normalized is not None:
+                    crop_embeddings.append(normalized)
                 methods.append(method)
 
         if crop_embeddings:
-            embedding = normalize_vector(np.vstack(crop_embeddings).mean(axis=0))
+            prototype_embeddings = np.vstack(crop_embeddings).astype(np.float32)
+            embedding = normalize_vector(prototype_embeddings.mean(axis=0))
             method = methods[-1] if methods else embedder.method
         else:
+            prototype_embeddings = None
             embedding, method = embedder.embed_bgr(self.best_crop)
         if embedding is None:
             print(f"[gallery] No embedding for track {self.track_id}: {self.clip_path}")
@@ -1274,10 +1888,21 @@ class PersonClipRecorder:
             max_frame_age_seconds=self.max_frame_age_seconds,
             embedding_method=method,
             recording_interrupted=self.recording_interrupted,
-            embedding_aggregation=f"mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
+            embedding_aggregation=f"prototype_mean_top_{len(crop_embeddings)}" if crop_embeddings else "single_best",
+            prototype_embeddings=prototype_embeddings,
+            prototype_score_mode=self.prototype_score_mode,
+            prototype_count=len(crop_embeddings),
+            crop_selection_strategy=self.selection_strategy,
             tracker_backend=str(tracker_backend),
             tracker_config_path=str(tracker_config_path),
             tracker_with_reid=tracker_with_reid,
+            close_reason=str(reason),
+            original_track_id=int(self.original_track_id),
+            current_track_id=int(self.current_track_id),
+            stitched_track_ids=[int(value) for value in self.stitched_track_ids],
+            stitch_events=list(self.stitch_events),
+            absorbed_track_ids=[int(value) for value in self.absorbed_track_ids],
+            track_ownership_events=list(self.track_ownership_events),
             source_fps=float(source_fps),
             analyzed_fps=float(analyzed_fps),
             dropped_frame_count=int(dropped_frame_count),
@@ -1404,6 +2029,7 @@ class LiveTopKCameraContext:
         self.analyzed_frames = 0
         self.read_failures = 0
         self.recorders: dict[int, PersonClipRecorder] = {}
+        self.pending_stitch_recorders: dict[int, PendingStitchRecorder] = {}
         self.recorder_lock = threading.Lock()
         self.frame_lock = threading.Lock()
         self.latest_frame: np.ndarray | None = None
@@ -1416,6 +2042,8 @@ class LiveTopKCameraContext:
         self._fps_window_frames = 0
         self.started_at = time.monotonic()
         self.last_query_sent_at = 0.0
+        self.crowded_until = 0.0
+        self.stitch_log_path = self.gallery.log_dir / "stitch_events.jsonl"
         tracker_config_path = resolve_tracker_config_path(str(args.tracker_backend), str(args.tracker_config_path))
         self.tracker_config_path = display_project_path(tracker_config_path)
         self.tracker_with_reid = tracker_config_with_reid(tracker_config_path)
@@ -1470,6 +2098,52 @@ class LiveTopKCameraContext:
         if elapsed <= 0:
             return 0.0
         return float(self.analyzed_frames) / elapsed
+
+    def _unique_recorders_locked(self) -> list[PersonClipRecorder]:
+        unique: list[PersonClipRecorder] = []
+        seen: set[int] = set()
+        for recorder in self.recorders.values():
+            marker = id(recorder)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append(recorder)
+        return unique
+
+    def _unique_pending_locked(self) -> list[tuple[int, PendingStitchRecorder]]:
+        unique: list[tuple[int, PendingStitchRecorder]] = []
+        seen: set[int] = set()
+        for track_id, pending in self.pending_stitch_recorders.items():
+            marker = id(pending.recorder)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            unique.append((int(track_id), pending))
+        return unique
+
+    def _attach_recorder_aliases_locked(self, recorder: PersonClipRecorder) -> None:
+        for track_id in sorted(int(value) for value in recorder.owned_track_ids if int(value) > 0):
+            self.recorders[int(track_id)] = recorder
+
+    def _detach_recorder_aliases_locked(self, recorder: PersonClipRecorder) -> list[int]:
+        removed = []
+        for track_id, candidate in list(self.recorders.items()):
+            if candidate is recorder:
+                removed.append(int(track_id))
+                self.recorders.pop(track_id, None)
+        return removed
+
+    def _detach_pending_aliases_locked(self, recorder: PersonClipRecorder) -> list[int]:
+        removed = []
+        for track_id, pending in list(self.pending_stitch_recorders.items()):
+            if pending.recorder is recorder:
+                removed.append(int(track_id))
+                self.pending_stitch_recorders.pop(track_id, None)
+        return removed
+
+    @staticmethod
+    def _recorder_visible_track_ids(recorder: PersonClipRecorder, current_track_ids: set[int]) -> set[int]:
+        return {int(track_id) for track_id in recorder.owned_track_ids if int(track_id) in current_track_ids}
 
     def process_next_analysis(self) -> bool:
         snapshot = self.next_frame_for_analysis()
@@ -1580,7 +2254,7 @@ class LiveTopKCameraContext:
     def _write_active_recorders(self, frame: np.ndarray) -> None:
         force_close_track_ids = []
         with self.recorder_lock:
-            for recorder in list(self.recorders.values()):
+            for recorder in self._unique_recorders_locked():
                 recorder.write_frame(frame, self.frame_index, 0.0)
                 if recorder.should_force_close(self.args.max_clip_seconds):
                     force_close_track_ids.append(recorder.track_id)
@@ -1588,6 +2262,7 @@ class LiveTopKCameraContext:
             self._finalize_recorder(track_id, "max_clip_seconds")
 
     def write_recording_tick(self) -> None:
+        self._expire_pending_stitch_recorders(time.monotonic())
         snapshot = self.latest_frame_snapshot()
         if snapshot is None:
             return
@@ -1600,7 +2275,7 @@ class LiveTopKCameraContext:
         close_track_ids: list[tuple[int, str]] = []
 
         with self.recorder_lock:
-            recorders = list(self.recorders.values())
+            recorders = self._unique_recorders_locked()
             if frame_age > reconnect_grace:
                 for recorder in recorders:
                     recorder.mark_interrupted()
@@ -1618,6 +2293,496 @@ class LiveTopKCameraContext:
         for track_id, reason in close_track_ids:
             self._finalize_recorder(track_id, reason)
 
+    def _tracklet_stitching_enabled(self) -> bool:
+        return self.cam_type == "G" and not bool(getattr(self.args, "disable_tracklet_stitching", False))
+
+    def _note_crowded_frame(self, people: list[dict[str, object]], now: float) -> None:
+        if has_crowded_overlap(people):
+            self.crowded_until = max(
+                float(self.crowded_until),
+                now + max(0.0, float(self.args.stitch_crowded_window_seconds)),
+            )
+
+    def _is_crowded_recent(self, now: float) -> bool:
+        return (not bool(self.args.stitch_allow_crowded)) and now < float(self.crowded_until)
+
+    def _log_duplicate_suppression(
+        self,
+        new_track_id: int,
+        matched_track_id: int,
+        quality: float,
+        iou: float,
+        containment: float,
+        center_distance_ratio: float,
+    ) -> None:
+        self._log_stitch_event(
+            {
+                "accepted": False,
+                "reason": "duplicate_track_suppressed",
+                "old_track_id": int(matched_track_id),
+                "new_track_id": int(new_track_id),
+                "source": "active_recorder",
+                "score": round(float(quality), 6),
+                "bbox_iou": round(float(iou), 6),
+                "bbox_containment": round(float(containment), 6),
+                "center_distance_ratio": round(float(center_distance_ratio), 6),
+            }
+        )
+
+    def _should_suppress_duplicate_track(
+        self,
+        person: dict[str, object],
+        frame: np.ndarray,
+    ) -> bool:
+        if bool(getattr(self.args, "disable_duplicate_track_suppression", False)):
+            return False
+        new_track_id = int(person.get("track_id", 0))
+        crop = visual_crop_person(frame, person["box"])
+        quality = visual_crop_quality(crop, person, frame.shape)
+        if quality > float(getattr(self.args, "duplicate_track_max_quality", 0.45)):
+            return False
+
+        min_iou = float(getattr(self.args, "duplicate_track_min_iou", 0.12))
+        max_distance = float(getattr(self.args, "duplicate_track_max_center_distance_ratio", 0.10))
+        with self.recorder_lock:
+            recorders = self._unique_recorders_locked() + [
+                pending.recorder for _track_id, pending in self._unique_pending_locked()
+        ]
+        for recorder in recorders:
+            if recorder.last_box is None or new_track_id in recorder.owned_track_ids:
+                continue
+            iou = box_iou(recorder.last_box, person["box"])
+            containment = box_intersection_over_min_area(recorder.last_box, person["box"])
+            distance = box_center_distance_ratio(recorder.last_box, person["box"], frame.shape)
+            if iou >= min_iou or containment >= 0.70 or distance <= max_distance:
+                self._log_duplicate_suppression(
+                    new_track_id,
+                    int(recorder.track_id),
+                    quality,
+                    iou,
+                    containment,
+                    distance,
+                )
+                return True
+        return False
+
+    def _candidate_absorb_recorders(self, person: dict[str, object], frame: np.ndarray):
+        new_track_id = int(person.get("track_id", 0))
+        candidates = []
+        with self.recorder_lock:
+            active_recorders = self._unique_recorders_locked()
+            pending_recorders = [
+                pending.recorder for _track_id, pending in self._unique_pending_locked()
+            ]
+        for source, recorders in (("active_recorder", active_recorders), ("pending_recorder", pending_recorders)):
+            for recorder in recorders:
+                if new_track_id in recorder.owned_track_ids or recorder.last_box is None:
+                    continue
+                iou = box_iou(recorder.last_box, person["box"])
+                containment = box_intersection_over_min_area(recorder.last_box, person["box"])
+                distance = box_center_distance_ratio(recorder.last_box, person["box"], frame.shape)
+                candidates.append((source, recorder, iou, containment, distance))
+        return candidates
+
+    def _try_absorb_duplicate_track(
+        self,
+        frame: np.ndarray,
+        person: dict[str, object],
+        source_frame_index: int,
+        now: float,
+    ) -> bool:
+        if bool(getattr(self.args, "disable_duplicate_track_suppression", False)):
+            return False
+        new_track_id = int(person.get("track_id", 0))
+        if new_track_id <= 0:
+            return False
+        with self.recorder_lock:
+            if new_track_id in self.recorders:
+                return True
+
+        crop = visual_crop_person(frame, person["box"])
+        quality = visual_crop_quality(crop, person, frame.shape)
+        candidates = self._candidate_absorb_recorders(person, frame)
+        if not candidates:
+            return False
+
+        max_distance = float(getattr(self.args, "duplicate_absorb_max_center_distance_ratio", 0.12))
+        min_iou = float(getattr(self.args, "duplicate_absorb_min_iou", 0.50))
+        min_containment = float(getattr(self.args, "duplicate_absorb_min_containment", 0.85))
+        low_quality_max = float(getattr(self.args, "duplicate_absorb_low_quality_max", 0.45))
+        low_quality_distance = float(getattr(self.args, "duplicate_absorb_low_quality_distance_ratio", 0.08))
+        reid_threshold = float(getattr(self.args, "duplicate_absorb_reid_threshold", 0.76))
+
+        accepted: list[tuple[float, str, str, PersonClipRecorder, float, float, float, str]] = []
+        for source, recorder, iou, containment, distance in candidates:
+            if distance > max_distance and not (quality <= low_quality_max and distance <= low_quality_distance):
+                continue
+            if containment >= min_containment and distance <= max_distance:
+                accepted.append((1.0 + containment, "containment_absorbed", source, recorder, iou, containment, distance, "geometry"))
+                continue
+            if iou >= min_iou and distance <= max_distance:
+                accepted.append((1.0 + iou, "active_duplicate_absorbed", source, recorder, iou, containment, distance, "geometry"))
+                continue
+            if quality <= low_quality_max and distance <= low_quality_distance and (iou >= 0.03 or containment >= 0.40):
+                accepted.append((0.90 + containment, "active_duplicate_absorbed", source, recorder, iou, containment, distance, "low_quality_geometry"))
+
+        if not accepted and crop is not None:
+            new_embedding, new_method = self.embedder.embed_bgr(crop)
+            new_embedding = normalize_vector(new_embedding)
+            if new_embedding is not None:
+                for source, recorder, iou, containment, distance in candidates:
+                    if distance > max_distance or (iou < 0.03 and containment < 0.40):
+                        continue
+                    old_prototypes, old_method = recorder.stitch_prototype_embeddings(self.embedder)
+                    if old_prototypes is None:
+                        continue
+                    prototype_scores = np.clip(old_prototypes @ new_embedding, -1.0, 1.0).reshape(-1)
+                    score = float(np.max(prototype_scores)) if prototype_scores.size else 0.0
+                    if score >= reid_threshold:
+                        accepted.append(
+                            (
+                                score,
+                                "prototype_absorbed",
+                                source,
+                                recorder,
+                                iou,
+                                containment,
+                                distance,
+                                old_method or new_method,
+                            )
+                        )
+
+        if not accepted:
+            return False
+
+        accepted.sort(key=lambda item: item[0], reverse=True)
+        score, reason, source, recorder, iou, containment, distance, method = accepted[0]
+        event = {
+            "accepted": True,
+            "reason": reason,
+            "old_track_id": int(recorder.current_track_id or recorder.track_id),
+            "new_track_id": int(new_track_id),
+            "source": source,
+            "score": round(float(score), 6),
+            "crop_quality": round(float(quality), 6),
+            "bbox_iou": round(float(iou), 6),
+            "bbox_containment": round(float(containment), 6),
+            "center_distance_ratio": round(float(distance), 6),
+            "time_gap_seconds": round(max(0.0, now - float(recorder.last_observed_at)), 3),
+            "embedding_method": method,
+            "source_frame_index": int(source_frame_index),
+        }
+
+        with self.recorder_lock:
+            if new_track_id in self.recorders:
+                return True
+            if source == "pending_recorder":
+                self._detach_pending_aliases_locked(recorder)
+            recorder.absorb_track_id(new_track_id, event)
+            recorder.observe(frame, person, source_frame_index)
+            self._attach_recorder_aliases_locked(recorder)
+        self._log_stitch_event(event)
+        print(
+            f"[absorb] cam={self.cam_label} track={new_track_id} -> recorder={event['old_track_id']} "
+            f"reason={reason} score={float(score):.3f} dist={distance:.3f} iou={iou:.3f}"
+        )
+        return True
+
+    def _log_stitch_event(self, payload: dict[str, object]) -> None:
+        payload = dict(payload)
+        payload.setdefault("session_id", self.session_id)
+        payload.setdefault("cam_id", self.cam_id)
+        payload.setdefault("cam_label", self.cam_label)
+        payload.setdefault("created_at", round(time.time(), 3))
+        self.stitch_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.stitch_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def _expire_pending_stitch_recorders(self, now: float) -> None:
+        expired: list[tuple[int, str]] = []
+        seen: set[int] = set()
+        with self.recorder_lock:
+            for track_id, pending in list(self.pending_stitch_recorders.items()):
+                marker = id(pending.recorder)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                if now >= float(pending.expires_at):
+                    expired.append((track_id, pending.close_reason))
+        for track_id, reason in expired:
+            self._finalize_recorder(track_id, reason)
+
+    def _park_recorder_for_stitching(self, track_id: int, reason: str, now: float) -> bool:
+        if not self._tracklet_stitching_enabled():
+            return False
+        stitch_window = max(0.0, float(self.args.stitch_window_seconds))
+        if stitch_window <= 0:
+            return False
+        with self.recorder_lock:
+            recorder = self.recorders.get(track_id)
+            if recorder is None or recorder.closed:
+                return False
+            self._detach_recorder_aliases_locked(recorder)
+            pending = PendingStitchRecorder(
+                recorder=recorder,
+                pending_since=float(now),
+                expires_at=float(now) + stitch_window,
+                close_reason=str(reason),
+            )
+            for owned_track_id in sorted(int(value) for value in recorder.owned_track_ids if int(value) > 0):
+                self.pending_stitch_recorders[int(owned_track_id)] = pending
+        self._log_stitch_event(
+            {
+                "accepted": False,
+                "reason": "parked_for_stitch_window",
+                "old_track_id": int(track_id),
+                "new_track_id": 0,
+                "source": "pending",
+                "stitch_window_seconds": round(stitch_window, 3),
+                "owned_track_ids": sorted(int(value) for value in recorder.owned_track_ids),
+            }
+        )
+        return True
+
+    def _candidate_stitch_recorders(self, now: float, new_track_id: int):
+        stitch_window = max(0.0, float(self.args.stitch_window_seconds))
+        candidates = []
+        with self.recorder_lock:
+            for recorder in self._unique_recorders_locked():
+                old_track_id = int(recorder.current_track_id or recorder.track_id)
+                if int(new_track_id) in recorder.owned_track_ids or recorder.missing_since is None:
+                    continue
+                time_gap = max(0.0, now - float(recorder.missing_since))
+                if time_gap <= stitch_window and recorder.best_crop is not None and recorder.last_box is not None:
+                    candidates.append(("active_missing", old_track_id, recorder, time_gap, tuple(recorder.last_box)))
+            for old_track_id, pending in self._unique_pending_locked():
+                recorder = pending.recorder
+                time_gap = max(0.0, now - float(pending.pending_since))
+                if time_gap <= stitch_window and recorder.best_crop is not None and recorder.last_box is not None:
+                    candidates.append(("pending", int(old_track_id), recorder, time_gap, tuple(recorder.last_box)))
+        return candidates
+
+    def _try_stitch_track(
+        self,
+        frame: np.ndarray,
+        person: dict[str, object],
+        source_frame_index: int,
+        now: float,
+    ) -> bool:
+        if not self._tracklet_stitching_enabled():
+            return False
+        new_track_id = int(person.get("track_id", 0))
+        if new_track_id <= 0:
+            return False
+
+        with self.recorder_lock:
+            if new_track_id in self.recorders:
+                return True
+            pending_same_track = self.pending_stitch_recorders.get(new_track_id)
+            if pending_same_track is not None:
+                recorder = pending_same_track.recorder
+                self._detach_pending_aliases_locked(recorder)
+                time_gap = max(0.0, now - float(pending_same_track.pending_since))
+                distance_ratio = (
+                    box_center_distance_ratio(recorder.last_box, person["box"], frame.shape)
+                    if recorder.last_box is not None
+                    else 0.0
+                )
+                payload = StitchDecision(
+                    accepted=True,
+                    reason="same_track_resumed",
+                    old_track_id=new_track_id,
+                    new_track_id=new_track_id,
+                    source="pending",
+                    score=1.0,
+                    second_score=-1.0,
+                    center_distance_ratio=distance_ratio,
+                    time_gap_seconds=time_gap,
+                    embedding_method="same_track_id",
+                ).to_json()
+                payload["source_frame_index"] = int(source_frame_index)
+                recorder.reassign_track_id(new_track_id, payload)
+                recorder.observe(frame, person, source_frame_index)
+                self._attach_recorder_aliases_locked(recorder)
+                self._log_stitch_event(payload)
+                print(
+                    f"[stitch] cam={self.cam_label} resumed track={new_track_id} "
+                    f"gap={time_gap:.2f}s dist={distance_ratio:.3f}"
+                )
+                return True
+
+        candidates = self._candidate_stitch_recorders(now, new_track_id)
+        if not candidates:
+            return False
+
+        crowded_recent = self._is_crowded_recent(now)
+        if crowded_recent:
+            near_limit = float(getattr(self.args, "stitch_crowded_near_distance_ratio", 0.08))
+            if not should_allow_crowded_stitch_by_geometry(candidates, person, frame.shape, near_limit):
+                source, old_track_id, _recorder, time_gap, old_box = min(
+                    candidates,
+                    key=lambda item: box_center_distance_ratio(item[4], person["box"], frame.shape),
+                )
+                decision = StitchDecision(
+                    accepted=False,
+                    reason="recent_crowded_frame",
+                    old_track_id=old_track_id,
+                    new_track_id=new_track_id,
+                    source=source,
+                    center_distance_ratio=box_center_distance_ratio(old_box, person["box"], frame.shape),
+                    time_gap_seconds=time_gap,
+                )
+                self._log_stitch_event(decision.to_json())
+                return False
+
+        new_crop = visual_crop_person(frame, person["box"])
+        new_embedding, new_method = self.embedder.embed_bgr(new_crop)
+        new_embedding = normalize_vector(new_embedding)
+        if new_embedding is None:
+            source, old_track_id, _recorder, time_gap, old_box = candidates[0]
+            decision = StitchDecision(
+                accepted=False,
+                reason="new_track_embedding_failed",
+                old_track_id=old_track_id,
+                new_track_id=new_track_id,
+                source=source,
+                center_distance_ratio=box_center_distance_ratio(old_box, person["box"], frame.shape),
+                time_gap_seconds=time_gap,
+                embedding_method=new_method,
+            )
+            self._log_stitch_event(decision.to_json())
+            return False
+
+        max_distance = max(0.0, float(self.args.stitch_max_center_distance_ratio))
+        threshold = float(self.args.stitch_reid_threshold)
+        scored: list[tuple[float, str, int, PersonClipRecorder, float, float, str, str]] = []
+        best_rejected: StitchDecision | None = None
+        for source, old_track_id, recorder, time_gap, old_box in candidates:
+            distance_ratio = box_center_distance_ratio(old_box, person["box"], frame.shape)
+            if distance_ratio > max_distance:
+                decision = StitchDecision(
+                    accepted=False,
+                    reason="bbox_center_too_far",
+                    old_track_id=old_track_id,
+                    new_track_id=new_track_id,
+                    source=source,
+                    center_distance_ratio=distance_ratio,
+                    time_gap_seconds=time_gap,
+                    embedding_method=new_method,
+                )
+                if best_rejected is None or decision.center_distance_ratio < best_rejected.center_distance_ratio:
+                    best_rejected = decision
+                continue
+
+            old_prototypes, old_method = recorder.stitch_prototype_embeddings(self.embedder)
+            if old_prototypes is None:
+                decision = StitchDecision(
+                    accepted=False,
+                    reason="old_track_embedding_failed",
+                    old_track_id=old_track_id,
+                    new_track_id=new_track_id,
+                    source=source,
+                    center_distance_ratio=distance_ratio,
+                    time_gap_seconds=time_gap,
+                    embedding_method=old_method or new_method,
+                )
+                best_rejected = best_rejected or decision
+                continue
+
+            prototype_scores = np.clip(old_prototypes @ new_embedding, -1.0, 1.0).reshape(-1)
+            score = float(np.max(prototype_scores)) if prototype_scores.size else 0.0
+            method = old_method or new_method
+            decision = StitchDecision(
+                accepted=False,
+                reason="reid_score_below_threshold",
+                old_track_id=old_track_id,
+                new_track_id=new_track_id,
+                source=source,
+                score=score,
+                center_distance_ratio=distance_ratio,
+                time_gap_seconds=time_gap,
+                embedding_method=method,
+            )
+            if score >= threshold:
+                scored.append((score, source, old_track_id, recorder, time_gap, distance_ratio, method, "stitched_tracklet"))
+            elif (
+                continuity_reason := spatial_continuity_stitch_reason(
+                    score,
+                    time_gap,
+                    distance_ratio,
+                    self.args,
+                    crowded_recent,
+                )
+            ):
+                scored.append((score, source, old_track_id, recorder, time_gap, distance_ratio, method, continuity_reason))
+            elif best_rejected is None or score > best_rejected.score:
+                best_rejected = decision
+
+        if not scored:
+            if best_rejected is not None:
+                self._log_stitch_event(best_rejected.to_json())
+            return False
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_score, source, old_track_id, recorder, time_gap, distance_ratio, method, accept_reason = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else -1.0
+        margin = float(self.args.stitch_ambiguous_margin)
+        if len(scored) > 1 and (best_score - second_score) < margin:
+            decision = StitchDecision(
+                accepted=False,
+                reason="ambiguous_stitch_candidate",
+                old_track_id=old_track_id,
+                new_track_id=new_track_id,
+                source=source,
+                score=best_score,
+                second_score=second_score,
+                center_distance_ratio=distance_ratio,
+                time_gap_seconds=time_gap,
+                embedding_method=method,
+            )
+            self._log_stitch_event(decision.to_json())
+            return False
+
+        decision = StitchDecision(
+            accepted=True,
+            reason=accept_reason,
+            old_track_id=old_track_id,
+            new_track_id=new_track_id,
+            source=source,
+            score=best_score,
+            second_score=second_score,
+            center_distance_ratio=distance_ratio,
+            time_gap_seconds=time_gap,
+            embedding_method=method,
+        )
+        payload = decision.to_json()
+        payload["source_frame_index"] = int(source_frame_index)
+        payload["stitch_score_mode"] = "prototype_max"
+
+        with self.recorder_lock:
+            if new_track_id in self.recorders:
+                return True
+            if source == "pending":
+                pending = self.pending_stitch_recorders.get(old_track_id)
+                if pending is None or pending.recorder is not recorder:
+                    return False
+                self._detach_pending_aliases_locked(recorder)
+            else:
+                active = self.recorders.get(old_track_id)
+                if active is None or active is not recorder:
+                    return False
+                self._detach_recorder_aliases_locked(recorder)
+            recorder.reassign_track_id(new_track_id, payload)
+            recorder.observe(frame, person, source_frame_index)
+            self._attach_recorder_aliases_locked(recorder)
+
+        self._log_stitch_event(payload)
+        print(
+            f"[stitch] cam={self.cam_label} old_track={old_track_id} -> new_track={new_track_id} "
+            f"score={best_score:.3f} gap={time_gap:.2f}s dist={distance_ratio:.3f}"
+        )
+        return True
+
     def _handle_gallery_people(
         self,
         frame: np.ndarray,
@@ -1626,22 +2791,37 @@ class LiveTopKCameraContext:
     ) -> None:
         current_track_ids = {int(person.get("track_id", 0)) for person in people}
         now = time.monotonic()
+        self._note_crowded_frame(people, now)
+        self._expire_pending_stitch_recorders(now)
         close_track_ids = []
         with self.recorder_lock:
-            for track_id, recorder in list(self.recorders.items()):
-                if track_id not in current_track_ids:
+            for recorder in self._unique_recorders_locked():
+                if not self._recorder_visible_track_ids(recorder, current_track_ids):
                     recorder.mark_missing(now)
                     if recorder.should_close_after_missing(
                         float(self.args.post_roll_seconds),
                         int(self.args.track_missing_grace),
                     ):
-                        close_track_ids.append(track_id)
+                        close_track_ids.append(int(recorder.current_track_id or recorder.track_id))
         for track_id in close_track_ids:
-            self._finalize_recorder(track_id, "person_left_frame")
+            if not self._park_recorder_for_stitching(track_id, "person_left_frame", now):
+                self._finalize_recorder(track_id, "person_left_frame")
 
         for person in people:
             track_id = int(person.get("track_id", 0))
             if track_id <= 0:
+                continue
+            with self.recorder_lock:
+                recorder = self.recorders.get(track_id)
+            if recorder is None and self._try_stitch_track(frame, person, source_frame_index, now):
+                continue
+            with self.recorder_lock:
+                recorder = self.recorders.get(track_id)
+            if recorder is None and self._try_absorb_duplicate_track(frame, person, source_frame_index, now):
+                continue
+            with self.recorder_lock:
+                recorder = self.recorders.get(track_id)
+            if recorder is None and self._should_suppress_duplicate_track(person, frame):
                 continue
             with self.recorder_lock:
                 recorder = self.recorders.get(track_id)
@@ -1659,6 +2839,11 @@ class LiveTopKCameraContext:
                         fps=float(self.args.recording_fps),
                         record_video_mode=str(self.args.record_video_mode),
                         top_n=max(1, int(self.args.live_visual_top_n)),
+                        selection_strategy=str(self.args.crop_selection_strategy),
+                        diversity_min_frame_gap=int(self.args.crop_diversity_min_frame_gap),
+                        diversity_max_similarity=float(self.args.crop_diversity_max_similarity),
+                        crop_min_quality_ratio=float(self.args.crop_min_quality_ratio),
+                        prototype_score_mode=str(self.args.prototype_score_mode),
                     )
                     self.recorders[track_id] = recorder
                 recorder.observe(frame, person, source_frame_index)
@@ -1752,7 +2937,8 @@ class LiveTopKCameraContext:
 
     def active_recording_count(self) -> int:
         with self.recorder_lock:
-            return len(self.recorders)
+            pending_count = len(self._unique_pending_locked())
+            return len(self._unique_recorders_locked()) + pending_count
 
     def _show_analysis_preview(self, frame: np.ndarray, people: list[dict[str, object]]) -> None:
         if not self.args.show_preview:
@@ -1819,7 +3005,13 @@ class LiveTopKCameraContext:
 
     def _finalize_recorder(self, track_id: int, reason: str) -> None:
         with self.recorder_lock:
-            recorder = self.recorders.pop(track_id, None)
+            recorder = self.recorders.get(track_id)
+            if recorder is None:
+                pending = self.pending_stitch_recorders.get(track_id)
+                recorder = None if pending is None else pending.recorder
+            if recorder is not None:
+                self._detach_recorder_aliases_locked(recorder)
+                self._detach_pending_aliases_locked(recorder)
         if recorder is None:
             return
         record = recorder.close(
@@ -1835,6 +3027,7 @@ class LiveTopKCameraContext:
             post_roll_seconds=float(self.args.post_roll_seconds),
             min_recorded_frames=int(self.args.min_recorded_frames),
             min_unique_frames=int(self.args.min_unique_frames),
+            min_gallery_crop_quality=float(self.args.min_gallery_crop_quality),
         )
         if record is None:
             return
@@ -1892,8 +3085,13 @@ class LiveTopKCameraContext:
 
     def _close_all_recorders(self, reason: str) -> None:
         with self.recorder_lock:
-            track_ids = list(self.recorders)
+            recorders = self._unique_recorders_locked()
+            pending_recorders = [pending.recorder for _track_id, pending in self._unique_pending_locked()]
+            track_ids = [int(recorder.current_track_id or recorder.track_id) for recorder in recorders]
+            pending_track_ids = [int(recorder.current_track_id or recorder.track_id) for recorder in pending_recorders]
         for track_id in track_ids:
+            self._finalize_recorder(track_id, reason)
+        for track_id in pending_track_ids:
             self._finalize_recorder(track_id, reason)
 
 
@@ -1945,6 +3143,10 @@ class CaptureWorker(threading.Thread):
             finally:
                 cap.release()
 
+            if source_is_finite_video(context.source_info):
+                print(f"[cam {context.cam_id}] Video file ended; stopping session.")
+                self.stop_event.set()
+                break
             if not self.stop_event.is_set():
                 time.sleep(context.args.reconnect_delay)
 
@@ -1959,6 +3161,8 @@ class CaptureWorker(threading.Thread):
 
     def _capture_loop(self, cap: cv2.VideoCapture) -> None:
         context = self.context
+        finite_video_interval = video_source_frame_interval(context.source_info, float(context.args.recording_fps))
+        next_frame_at = time.monotonic()
         while not self.stop_event.is_set():
             if self._runtime_expired():
                 self.stop_event.set()
@@ -1977,6 +3181,7 @@ class CaptureWorker(threading.Thread):
             context.frame_index += 1
             captured_at = time.monotonic()
             context.update_latest_frame(frame, context.frame_index, captured_at)
+            next_frame_at = sleep_for_finite_video_frame(next_frame_at, finite_video_interval, self.stop_event)
 
 
 class RecordingWorker(threading.Thread):
@@ -2087,6 +3292,23 @@ def main() -> int:
         f"min_unique_frames={args.min_unique_frames} "
         f"stale_frame_seconds={args.recording_stale_frame_seconds} "
         f"reconnect_grace_seconds={args.recording_reconnect_grace_seconds}"
+    )
+    print(
+        f"Tracklet stitching: enabled={not args.disable_tracklet_stitching} "
+        f"window={args.stitch_window_seconds}s "
+        f"reid_threshold={args.stitch_reid_threshold} "
+        f"ambiguous_margin={args.stitch_ambiguous_margin} "
+        f"max_center_distance={args.stitch_max_center_distance_ratio} "
+        f"crowded_window={args.stitch_crowded_window_seconds}s "
+        f"allow_crowded={args.stitch_allow_crowded}"
+    )
+    print(
+        f"Crop prototypes: strategy={args.crop_selection_strategy} "
+        f"top_n={args.live_visual_top_n} "
+        f"score_mode={args.prototype_score_mode} "
+        f"min_frame_gap={args.crop_diversity_min_frame_gap} "
+        f"max_similarity={args.crop_diversity_max_similarity} "
+        f"min_quality_ratio={args.crop_min_quality_ratio}"
     )
     print(f"Embedding model: {args.embedding_model} method={embedder.method} device={embedder.device}")
     if args.show_preview:

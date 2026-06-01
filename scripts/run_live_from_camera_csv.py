@@ -27,8 +27,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--inference-interval", type=int, default=2)
     parser.add_argument("--post-roll-seconds", type=float, default=2.0)
+    parser.add_argument("--disable-tracklet-stitching", action="store_true")
+    parser.add_argument("--stitch-window-seconds", type=float, default=1.5)
+    parser.add_argument("--stitch-reid-threshold", type=float, default=0.76)
+    parser.add_argument("--stitch-ambiguous-margin", type=float, default=0.08)
+    parser.add_argument("--stitch-max-center-distance-ratio", type=float, default=0.35)
+    parser.add_argument("--stitch-spatial-resume-window-seconds", type=float, default=1.5)
+    parser.add_argument("--stitch-spatial-resume-max-distance-ratio", type=float, default=0.02)
+    parser.add_argument("--stitch-spatial-resume-min-score", type=float, default=0.55)
+    parser.add_argument("--stitch-micro-gap-seconds", type=float, default=0.35)
+    parser.add_argument("--stitch-micro-gap-max-distance-ratio", type=float, default=0.06)
+    parser.add_argument("--stitch-micro-gap-min-score", type=float, default=0.35)
+    parser.add_argument("--stitch-crowded-window-seconds", type=float, default=2.0)
+    parser.add_argument("--stitch-crowded-near-distance-ratio", type=float, default=0.08)
+    parser.add_argument("--stitch-allow-crowded", action="store_true")
+    parser.add_argument("--disable-duplicate-track-suppression", action="store_true")
+    parser.add_argument("--duplicate-absorb-reid-threshold", type=float, default=0.76)
+    parser.add_argument("--duplicate-absorb-max-center-distance-ratio", type=float, default=0.12)
+    parser.add_argument("--duplicate-absorb-min-iou", type=float, default=0.50)
+    parser.add_argument("--duplicate-absorb-min-containment", type=float, default=0.85)
+    parser.add_argument("--duplicate-absorb-low-quality-max", type=float, default=0.45)
+    parser.add_argument("--duplicate-absorb-low-quality-distance-ratio", type=float, default=0.08)
+    parser.add_argument("--duplicate-track-max-quality", type=float, default=0.45)
+    parser.add_argument("--duplicate-track-min-iou", type=float, default=0.12)
+    parser.add_argument("--duplicate-track-max-center-distance-ratio", type=float, default=0.10)
     parser.add_argument("--min-clip-seconds", type=float, default=1.5)
-    parser.add_argument("--live-visual-top-n", type=int, default=3)
+    parser.add_argument("--min-gallery-crop-quality", type=float, default=0.45)
+    parser.add_argument("--live-visual-top-n", type=int, default=6)
+    parser.add_argument("--crop-selection-strategy", choices=("diverse-quality", "quality-only"), default="diverse-quality")
+    parser.add_argument("--prototype-score-mode", choices=("max", "top2-mean", "mean"), default="max")
+    parser.add_argument("--crop-diversity-min-frame-gap", type=int, default=15)
+    parser.add_argument("--crop-diversity-max-similarity", type=float, default=0.92)
+    parser.add_argument("--crop-min-quality-ratio", type=float, default=0.70)
     parser.add_argument("--topk", type=int, default=7)
     parser.add_argument("--candidate-pool", type=int, default=12)
     parser.add_argument("--frame-width", type=int, default=1280)
@@ -168,10 +198,64 @@ def main() -> int:
         str(max(1, int(args.inference_interval))),
         "--post-roll-seconds",
         str(args.post_roll_seconds),
+        "--stitch-window-seconds",
+        str(args.stitch_window_seconds),
+        "--stitch-reid-threshold",
+        str(args.stitch_reid_threshold),
+        "--stitch-ambiguous-margin",
+        str(args.stitch_ambiguous_margin),
+        "--stitch-max-center-distance-ratio",
+        str(args.stitch_max_center_distance_ratio),
+        "--stitch-spatial-resume-window-seconds",
+        str(args.stitch_spatial_resume_window_seconds),
+        "--stitch-spatial-resume-max-distance-ratio",
+        str(args.stitch_spatial_resume_max_distance_ratio),
+        "--stitch-spatial-resume-min-score",
+        str(args.stitch_spatial_resume_min_score),
+        "--stitch-micro-gap-seconds",
+        str(args.stitch_micro_gap_seconds),
+        "--stitch-micro-gap-max-distance-ratio",
+        str(args.stitch_micro_gap_max_distance_ratio),
+        "--stitch-micro-gap-min-score",
+        str(args.stitch_micro_gap_min_score),
+        "--stitch-crowded-window-seconds",
+        str(args.stitch_crowded_window_seconds),
+        "--stitch-crowded-near-distance-ratio",
+        str(args.stitch_crowded_near_distance_ratio),
+        "--duplicate-absorb-reid-threshold",
+        str(args.duplicate_absorb_reid_threshold),
+        "--duplicate-absorb-max-center-distance-ratio",
+        str(args.duplicate_absorb_max_center_distance_ratio),
+        "--duplicate-absorb-min-iou",
+        str(args.duplicate_absorb_min_iou),
+        "--duplicate-absorb-min-containment",
+        str(args.duplicate_absorb_min_containment),
+        "--duplicate-absorb-low-quality-max",
+        str(args.duplicate_absorb_low_quality_max),
+        "--duplicate-absorb-low-quality-distance-ratio",
+        str(args.duplicate_absorb_low_quality_distance_ratio),
+        "--duplicate-track-max-quality",
+        str(args.duplicate_track_max_quality),
+        "--duplicate-track-min-iou",
+        str(args.duplicate_track_min_iou),
+        "--duplicate-track-max-center-distance-ratio",
+        str(args.duplicate_track_max_center_distance_ratio),
         "--min-clip-seconds",
         str(args.min_clip_seconds),
+        "--min-gallery-crop-quality",
+        str(args.min_gallery_crop_quality),
         "--live-visual-top-n",
         str(max(1, int(args.live_visual_top_n))),
+        "--crop-selection-strategy",
+        args.crop_selection_strategy,
+        "--prototype-score-mode",
+        args.prototype_score_mode,
+        "--crop-diversity-min-frame-gap",
+        str(args.crop_diversity_min_frame_gap),
+        "--crop-diversity-max-similarity",
+        str(args.crop_diversity_max_similarity),
+        "--crop-min-quality-ratio",
+        str(args.crop_min_quality_ratio),
         "--topk",
         str(max(1, int(args.topk))),
         "--candidate-pool",
@@ -221,6 +305,12 @@ def main() -> int:
         command.extend(["--max-runtime-seconds", str(args.max_runtime_seconds)])
     if args.disable_osc:
         command.append("--disable-osc")
+    if args.disable_tracklet_stitching:
+        command.append("--disable-tracklet-stitching")
+    if args.stitch_allow_crowded:
+        command.append("--stitch-allow-crowded")
+    if args.disable_duplicate_track_suppression:
+        command.append("--disable-duplicate-track-suppression")
     if args.osc_dry_run:
         command.append("--osc-dry-run")
     if args.show_preview:
